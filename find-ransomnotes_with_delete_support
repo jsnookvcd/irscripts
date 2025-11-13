@@ -1,0 +1,199 @@
+<#
+.SYNOPSIS
+  Simple ransomware note finder for IR, with optional delete.
+
+.EXAMPLES
+
+  # Filename-only scan
+  .\Find-RansomNotes.ps1 -Root "C:\"
+
+  # Scan with content and export CSV
+  .\Find-RansomNotes.ps1 -Root "C:\" -ScanContent -Output "C:\temp\ransom_notes.csv"
+
+  # Scan and delete hits (will prompt for confirmation)
+  .\Find-RansomNotes.ps1 -Root "C:\" -ScanContent -Delete
+
+  # Scan and delete hits silently (no confirm, no prompt)
+  .\Find-RansomNotes.ps1 -Root "C:\" -ScanContent -Delete -Confirm:$false
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+param(
+    [string]$Root = "C:\",
+    [switch]$ScanContent,
+    [int]$MaxSizeKB = 128,
+    [string]$Output,
+    [switch]$Delete   # <--- new
+)
+
+# --- Configurable patterns ---
+
+# Common ransom-note filenames
+$NamePatterns = @(
+    'read[_\- ]?me',             # READ_ME.txt, read-me.html
+    'how[_\- ]?to[_\- ]?decrypt',
+    'how[_\- ]?to[_\- ]?restore',
+    'decrypt[_\- ]?files?',
+    'decrypt[_\- ]?instructions?',
+    'recover[_\- ]?files?',
+    'restore[_\- ]?files?',
+    'help[_\- ]?decrypt',
+    'help[_\- ]?your[_\- ]?files',
+    'attention[_\- ]?read',
+    'unlock[_\- ]?files?',
+    'ransom'                     # ransom.txt
+)
+
+# Content indicators
+$ContentPatterns = @(
+    'your files (have been|are) encrypted',
+    'all your files',
+    'decrypt your files',
+    'decryption key',
+    'bitcoin',
+    '\bbtc\b',
+    'monero',
+    '\bxmr\b',
+    'tor browser',
+    '\.onion',
+    'personal id',
+    'victim id',
+    'contact us',
+    'email us'
+)
+
+# File extensions we consider "text-ish" for content scanning
+$TextExts = @('.txt','.html','.htm','.md','.rtf','.log','.json')
+
+# Directories to skip (tweak for your environment)
+$SkipFragments = @(
+    '\\Windows\\',
+    '\\Program Files\\',
+    '\\Program Files (x86)\\',
+    '\\ProgramData\\',
+    '\\AppData\\Local\\Temp\\',
+    '\\AppData\\Local\\Microsoft\\Windows\\INetCache\\'
+)
+
+function Test-SuspiciousName {
+    param(
+        [string]$Name
+    )
+    $lower = $Name.ToLower()
+    foreach ($p in $NamePatterns) {
+        if ($lower -match $p) { return $true }
+    }
+    return $false
+}
+
+function Test-SuspiciousContent {
+    param(
+        [string]$Path,
+        [int]$MaxBytes
+    )
+
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -gt $MaxBytes) {
+            $bytes = $bytes[0..($MaxBytes-1)]
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        return $false
+    }
+
+    foreach ($p in $ContentPatterns) {
+        if ($text -match $p) { return $true }
+    }
+    return $false
+}
+
+function Test-ShouldSkipDir {
+    param(
+        [string]$DirPath
+    )
+    $lower = $DirPath.ToLower()
+    foreach ($frag in $SkipFragments) {
+        if ($lower -like "*$frag*".ToLower()) {
+            return $true
+        }
+    }
+    return $false
+}
+
+Write-Host "[*] Scanning root: $Root"
+if ($ScanContent) {
+    Write-Host "[*] Content scanning enabled (<= $MaxSizeKB KB)"
+} else {
+    Write-Host "[*] Content scanning disabled"
+}
+
+if ($Delete) {
+    Write-Host "[!] DELETE MODE ENABLED - matching files may be removed" -ForegroundColor Yellow
+    Write-Host "    Use -WhatIf or -Confirm:\$false as needed." -ForegroundColor Yellow
+}
+
+$maxBytes = $MaxSizeKB * 1024
+$results = New-Object System.Collections.Generic.List[Object]
+
+# Walk filesystem
+Get-ChildItem -Path $Root -Recurse -File -ErrorAction SilentlyContinue -Force | ForEach-Object {
+    $file = $_
+
+    # Skip system-y dirs
+    $dirPath = $file.DirectoryName
+    if (Test-ShouldSkipDir -DirPath $dirPath) {
+        return
+    }
+
+    $nameFlag = Test-SuspiciousName -Name $file.Name
+    $contentFlag = $false
+
+    if ($ScanContent) {
+        $ext = $file.Extension.ToLower()
+        if ($TextExts -contains $ext -and $file.Length -le $maxBytes) {
+            $contentFlag = Test-SuspiciousContent -Path $file.FullName -MaxBytes $maxBytes
+        }
+    }
+
+    if ($nameFlag -or $contentFlag) {
+        $deleted = $false
+
+        if ($Delete) {
+            if ($PSCmdlet.ShouldProcess($file.FullName, "Delete ransom note candidate")) {
+                try {
+                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                    Write-Host "[X] Deleted: $($file.FullName)" -ForegroundColor Red
+                    $deleted = $true
+                } catch {
+                    Write-Warning "[-] Failed to delete $($file.FullName): $($_.Exception.Message)"
+                }
+            }
+        } else {
+            Write-Host "[+] Hit: $($file.FullName)"
+        }
+
+        $obj = [PSCustomObject]@{
+            Path          = $file.FullName
+            SizeBytes     = $file.Length
+            LastWriteTime = $file.LastWriteTime
+            NameFlag      = $nameFlag
+            ContentFlag   = $contentFlag
+            Deleted       = $deleted
+        }
+        $results.Add($obj) | Out-Null
+    }
+}
+
+Write-Host "[*] Found $($results.Count) potential ransom notes."
+
+if ($Output) {
+    try {
+        $results | Export-Csv -Path $Output -NoTypeInformation -Encoding UTF8
+        Write-Host "[+] Results written to $Output"
+    } catch {
+        Write-Warning "[-] Failed to write CSV: $($_.Exception.Message)"
+    }
+} else {
+    $results | Format-Table -AutoSize
+}
