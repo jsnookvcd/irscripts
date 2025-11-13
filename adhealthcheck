@@ -1,0 +1,99 @@
+<#
+.SYNOPSIS
+    Active Directory Health Check Script
+.DESCRIPTION
+    This script performs a comprehensive health check across the Active Directory environment.
+    It validates DC status, replication, DNS health, SYSVOL, FSMO roles, and time synchronization.
+    Outputs results to screen and a timestamped log file.
+.AUTHOR
+    Vendetta Cyber Defense | Jordan Snook
+#>
+
+#========================
+# Setup
+#========================
+$Date = Get-Date -Format "yyyyMMdd_HHmmss"
+$ReportPath = "C:\AD_HealthCheck_$Date.txt"
+$Domain = (Get-ADDomain).DNSRoot
+Add-Content $ReportPath "Active Directory Health Check Report - $Date"
+Add-Content $ReportPath "Domain: $Domain"
+Add-Content $ReportPath "====================================================`n"
+
+Write-Host "Starting AD Health Check..." -ForegroundColor Cyan
+
+#========================
+# Domain Controller Status
+#========================
+Add-Content $ReportPath "### Domain Controller Status ###"
+$DCs = Get-ADDomainController -Filter *
+foreach ($DC in $DCs) {
+    Add-Content $ReportPath "`n[$($DC.HostName)]"
+    Add-Content $ReportPath "Site: $($DC.Site)"
+    Add-Content $ReportPath "IPv4: $($DC.IPv4Address)"
+    Add-Content $ReportPath "Global Catalog: $($DC.IsGlobalCatalog)"
+    Add-Content $ReportPath "Writable: $($DC.IsReadOnly -eq $false)"
+    Add-Content $ReportPath "Operational: $(if (Test-Connection -ComputerName $DC.HostName -Count 1 -Quiet) {'Yes'} else {'No'})"
+}
+
+#========================
+# Replication Health
+#========================
+Add-Content $ReportPath "`n### Replication Health ###"
+repadmin /replsummary | Tee-Object -FilePath $ReportPath -Append
+Add-Content $ReportPath "`nDetailed replication status:`n"
+repadmin /showrepl * /csv | Tee-Object -FilePath $ReportPath -Append
+
+#========================
+# DNS Health
+#========================
+Add-Content $ReportPath "`n### DNS Health ###"
+dcdiag /test:dns /v | Tee-Object -FilePath $ReportPath -Append
+
+#========================
+# SYSVOL & Netlogon Share Check
+#========================
+Add-Content $ReportPath "`n### SYSVOL and Netlogon Shares ###"
+foreach ($DC in $DCs) {
+    $shares = Get-SmbShare -CimSession $DC.HostName | Where-Object { $_.Name -in @("SYSVOL", "NETLOGON") }
+    Add-Content $ReportPath "`n[$($DC.HostName)] Shares:"
+    if ($shares) { $shares | ForEach-Object { Add-Content $ReportPath "$($_.Name) - $($_.Path)" } }
+    else { Add-Content $ReportPath "Shares not found or inaccessible" }
+}
+
+#========================
+# FSMO Role Holders
+#========================
+Add-Content $ReportPath "`n### FSMO Role Holders ###"
+netdom query fsmo | Tee-Object -FilePath $ReportPath -Append
+
+#========================
+# Time Synchronization
+#========================
+Add-Content $ReportPath "`n### Time Synchronization ###"
+foreach ($DC in $DCs) {
+    Add-Content $ReportPath "`n[$($DC.HostName)]"
+    w32tm /query /status /computer:$($DC.HostName) | Tee-Object -FilePath $ReportPath -Append
+}
+
+#========================
+# Event Log Errors (Directory Services)
+#========================
+Add-Content $ReportPath "`n### Recent Directory Service Errors (Last 24h) ###"
+foreach ($DC in $DCs) {
+    Add-Content $ReportPath "`n[$($DC.HostName)]"
+    Get-WinEvent -ComputerName $DC.HostName -FilterHashtable @{
+        LogName = 'Directory Service'
+        Level = 2
+        StartTime = (Get-Date).AddDays(-1)
+    } -ErrorAction SilentlyContinue | 
+    Select-Object TimeCreated, Id, Message |
+    Format-Table -AutoSize | Out-String | Add-Content $ReportPath
+}
+
+#========================
+# Output Summary
+#========================
+Add-Content $ReportPath "`n===================================================="
+Add-Content $ReportPath "Health Check Completed on $Date"
+Add-Content $ReportPath "Report saved to $ReportPath"
+Write-Host "`nHealth Check Complete! Report saved to $ReportPath" -ForegroundColor Green
