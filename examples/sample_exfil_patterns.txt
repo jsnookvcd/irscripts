@@ -1,0 +1,163 @@
+# IR Recovery Utility - Sample Exfiltration Search Patterns
+# Lines starting with # are comments and will be ignored
+# Blank lines are also ignored
+#
+# These patterns are used to search for potential data exfiltration
+# They can be:
+# - Regex patterns to match file content
+# - Filename patterns
+# - Keywords indicating sensitive data
+#
+# Customize these based on your organization's sensitive data types
+
+# ============================================================================
+# FINANCIAL DATA PATTERNS
+# ============================================================================
+
+# Credit card numbers (basic patterns)
+\b4[0-9]{12}(?:[0-9]{3})?\b
+\b5[1-5][0-9]{14}\b
+\b3[47][0-9]{13}\b
+
+# Bank account patterns
+\b[0-9]{8,17}\b
+IBAN
+SWIFT
+routing.?number
+account.?number
+
+# Financial keywords
+salary
+compensation
+payroll
+invoice
+financial.?statement
+revenue
+profit
+budget
+
+# ============================================================================
+# PERSONAL IDENTIFIABLE INFORMATION (PII)
+# ============================================================================
+
+# SSN patterns (US)
+\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b
+
+# Date of birth patterns
+\b(0[1-9]|1[0-2])[-/](0[1-9]|[12][0-9]|3[01])[-/](19|20)[0-9]{2}\b
+
+# PII keywords
+social.?security
+passport
+driver.?license
+date.?of.?birth
+dob
+ssn
+national.?id
+tax.?id
+employee.?id
+
+# ============================================================================
+# AUTHENTICATION & SECRETS
+# ============================================================================
+
+# Password patterns
+password\s*[:=]
+passwd
+credentials
+api.?key
+api.?secret
+access.?token
+auth.?token
+bearer
+private.?key
+secret.?key
+
+# AWS patterns
+AKIA[0-9A-Z]{16}
+aws_access_key
+aws_secret
+
+# Database connection strings
+connection.?string
+jdbc:
+mongodb://
+mysql://
+postgresql://
+
+# ============================================================================
+# INTELLECTUAL PROPERTY
+# ============================================================================
+
+# Source code indicators
+proprietary
+confidential
+internal.?use.?only
+trade.?secret
+patent.?pending
+copyright
+
+# Project keywords
+roadmap
+strategic.?plan
+merger
+acquisition
+prototype
+research
+
+# ============================================================================
+# HEALTH DATA (HIPAA)
+# ============================================================================
+
+patient.?id
+medical.?record
+diagnosis
+treatment
+prescription
+health.?insurance
+hipaa
+phi
+protected.?health
+
+# ============================================================================
+# NETWORK & INFRASTRUCTURE
+# ============================================================================
+
+# Network credentials
+snmp.?community
+enable.?password
+admin.?password
+root.?password
+
+# Infrastructure details
+network.?diagram
+topology
+firewall.?rule
+vpn.?config
+domain.?admin
+
+# ============================================================================
+# FILE NAMING PATTERNS (for filename matching)
+# ============================================================================
+
+# Common exfil staging file names
+*_dump_*
+*_export_*
+*_backup_*
+*_extract_*
+*_collected_*
+data_*
+all_*
+full_*
+
+# Compressed archives in suspicious locations
+*.7z
+*.rar
+*.tar.gz
+*.zip
+
+# Database dumps
+*.sql
+*.bak
+*.mdb
+*.accdb

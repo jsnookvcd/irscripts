@@ -1,0 +1,1287 @@
+<#
+.SYNOPSIS
+    IR Recovery Utility - Comprehensive Incident Response and Recovery Tool
+.DESCRIPTION
+    This utility provides three core incident response capabilities:
+    1. Domain Controller Review - Health checks, replication status, service verification
+    2. IOC Detection - Search for Indicators of Compromise (file hashes, IPs, domains, filenames)
+    3. Exfiltration Search - Scan systems for potential data exfiltration based on patterns from a file
+
+    Designed for post-incident recovery and threat hunting in Active Directory environments.
+.AUTHOR
+    IR Security Team
+.PARAMETER Mode
+    Operation mode: DCReview, IOCSearch, ExfilSearch, or Full (runs all modes)
+.PARAMETER IOCFile
+    Path to text file containing IOCs (one per line). Supports: MD5/SHA1/SHA256 hashes, IPs, domains, filenames
+.PARAMETER ExfilPatternsFile
+    Path to text file containing exfiltration search patterns (one per line)
+.PARAMETER TargetComputers
+    Array of computer names to scan. Default: All domain computers
+.PARAMETER OutputPath
+    Directory for output reports. Default: C:\IR_Reports
+.PARAMETER IncludeOffline
+    Include offline computers in reports (marked as unreachable)
+.PARAMETER MaxThreads
+    Maximum concurrent remote connections. Default: 10
+.PARAMETER ScanDepth
+    Directory scan depth for exfiltration search. Default: 5
+.EXAMPLE
+    .\ir-recovery-utility -Mode DCReview
+    Reviews all Domain Controllers for health and security issues.
+.EXAMPLE
+    .\ir-recovery-utility -Mode IOCSearch -IOCFile C:\iocs.txt
+    Searches for IOCs specified in the file across all domain computers.
+.EXAMPLE
+    .\ir-recovery-utility -Mode ExfilSearch -ExfilPatternsFile C:\exfil_patterns.txt -TargetComputers "SERVER01","SERVER02"
+    Searches specific servers for potential exfiltrated data.
+.EXAMPLE
+    .\ir-recovery-utility -Mode Full -IOCFile C:\iocs.txt -ExfilPatternsFile C:\exfil_patterns.txt
+    Runs complete IR recovery assessment.
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("DCReview", "IOCSearch", "ExfilSearch", "Full")]
+    [string]$Mode,
+
+    [Parameter(Mandatory = $false)]
+    [string]$IOCFile,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ExfilPatternsFile,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$TargetComputers,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = "C:\IR_Reports",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeOffline,
+
+    [Parameter(Mandatory = $false)]
+    [int]$MaxThreads = 10,
+
+    [Parameter(Mandatory = $false)]
+    [int]$ScanDepth = 5
+)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$ReportPrefix = "IR_Recovery"
+
+# Critical Windows services to verify on DCs
+$CriticalDCServices = @(
+    "NTDS",           # Active Directory Domain Services
+    "DNS",            # DNS Server
+    "Netlogon",       # Net Logon
+    "DFSR",           # DFS Replication
+    "W32Time",        # Windows Time
+    "KDC",            # Kerberos Key Distribution Center
+    "ADWS",           # Active Directory Web Services
+    "LanmanServer",   # Server (file sharing)
+    "LanmanWorkstation" # Workstation
+)
+
+# High-risk scheduled task patterns (potential persistence)
+$SuspiciousTaskPatterns = @(
+    "powershell.*-enc",
+    "powershell.*downloadstring",
+    "powershell.*iex",
+    "cmd.*/c.*http",
+    "wscript.*http",
+    "cscript.*http",
+    "mshta.*http",
+    "regsvr32.*/s.*/u",
+    "rundll32.*javascript",
+    "certutil.*-urlcache"
+)
+
+# Suspicious service binary paths
+$SuspiciousServicePaths = @(
+    "\\temp\\",
+    "\\tmp\\",
+    "\\appdata\\",
+    "\\public\\",
+    "\\programdata\\(?!microsoft)",
+    "\\users\\.*\\downloads\\"
+)
+
+# Common exfiltration staging directories
+$ExfilStagingDirs = @(
+    "C:\Windows\Temp",
+    "C:\Temp",
+    "C:\PerfLogs",
+    "C:\Users\Public",
+    "C:\ProgramData"
+)
+
+# File extensions commonly used for exfiltration
+$ExfilExtensions = @(
+    ".7z", ".zip", ".rar", ".tar", ".gz",
+    ".csv", ".xlsx", ".docx", ".pdf",
+    ".pst", ".ost", ".nsf",
+    ".sql", ".bak", ".mdb",
+    ".kdbx", ".key", ".pem", ".pfx"
+)
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+function Write-IRLog {
+    param(
+        [string]$Message,
+        [ValidateSet("Info", "Success", "Warning", "Error", "Critical")]
+        [string]$Level = "Info"
+    )
+
+    $Prefix = switch ($Level) {
+        "Info"     { "[*]"; $Color = "Cyan" }
+        "Success"  { "[+]"; $Color = "Green" }
+        "Warning"  { "[!]"; $Color = "Yellow" }
+        "Error"    { "[-]"; $Color = "Red" }
+        "Critical" { "[!!!]"; $Color = "Magenta" }
+    }
+
+    $LogMessage = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Prefix $Message"
+    Write-Host $LogMessage -ForegroundColor $Color
+
+    if ($script:LogFile) {
+        Add-Content -Path $script:LogFile -Value $LogMessage -ErrorAction SilentlyContinue
+    }
+}
+
+function Initialize-IREnvironment {
+    Write-IRLog "Initializing IR Recovery Utility environment..." -Level Info
+
+    # Create output directory
+    if (-not (Test-Path $OutputPath)) {
+        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+        Write-IRLog "Created output directory: $OutputPath" -Level Success
+    }
+
+    # Initialize log file
+    $script:LogFile = Join-Path $OutputPath "$ReportPrefix`_$Timestamp.log"
+    Write-IRLog "Log file: $script:LogFile" -Level Info
+
+    # Verify AD module
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        Write-IRLog "Active Directory module loaded" -Level Success
+    }
+    catch {
+        Write-IRLog "Failed to load Active Directory module: $_" -Level Error
+        throw "Active Directory module is required"
+    }
+
+    # Get domain info
+    try {
+        $script:Domain = Get-ADDomain
+        $script:DomainName = $script:Domain.DNSRoot
+        Write-IRLog "Connected to domain: $($script:DomainName)" -Level Success
+    }
+    catch {
+        Write-IRLog "Failed to query domain: $_" -Level Error
+        throw "Cannot connect to Active Directory"
+    }
+}
+
+function Test-ComputerConnectivity {
+    param([string]$ComputerName)
+
+    $Result = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
+    return $Result
+}
+
+function Get-FileHashSafe {
+    param(
+        [string]$Path,
+        [string]$Algorithm = "SHA256"
+    )
+
+    try {
+        $Hash = Get-FileHash -Path $Path -Algorithm $Algorithm -ErrorAction Stop
+        return $Hash.Hash
+    }
+    catch {
+        return $null
+    }
+}
+
+function Parse-IOCFile {
+    param([string]$FilePath)
+
+    $IOCs = @{
+        Hashes = @()
+        IPs = @()
+        Domains = @()
+        Filenames = @()
+    }
+
+    if (-not (Test-Path $FilePath)) {
+        Write-IRLog "IOC file not found: $FilePath" -Level Error
+        return $null
+    }
+
+    $Lines = Get-Content $FilePath -ErrorAction SilentlyContinue | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' }
+
+    foreach ($Line in $Lines) {
+        $Line = $Line.Trim()
+
+        # MD5 hash (32 hex chars)
+        if ($Line -match '^[a-fA-F0-9]{32}$') {
+            $IOCs.Hashes += @{ Value = $Line.ToUpper(); Type = "MD5" }
+        }
+        # SHA1 hash (40 hex chars)
+        elseif ($Line -match '^[a-fA-F0-9]{40}$') {
+            $IOCs.Hashes += @{ Value = $Line.ToUpper(); Type = "SHA1" }
+        }
+        # SHA256 hash (64 hex chars)
+        elseif ($Line -match '^[a-fA-F0-9]{64}$') {
+            $IOCs.Hashes += @{ Value = $Line.ToUpper(); Type = "SHA256" }
+        }
+        # IP Address
+        elseif ($Line -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+            $IOCs.IPs += $Line
+        }
+        # Domain (basic pattern)
+        elseif ($Line -match '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$') {
+            $IOCs.Domains += $Line.ToLower()
+        }
+        # Filename pattern
+        else {
+            $IOCs.Filenames += $Line
+        }
+    }
+
+    Write-IRLog "Parsed IOCs - Hashes: $($IOCs.Hashes.Count), IPs: $($IOCs.IPs.Count), Domains: $($IOCs.Domains.Count), Filenames: $($IOCs.Filenames.Count)" -Level Info
+    return $IOCs
+}
+
+function Parse-ExfilPatternsFile {
+    param([string]$FilePath)
+
+    if (-not (Test-Path $FilePath)) {
+        Write-IRLog "Exfiltration patterns file not found: $FilePath" -Level Error
+        return $null
+    }
+
+    $Patterns = Get-Content $FilePath -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' } |
+        ForEach-Object { $_.Trim() }
+
+    Write-IRLog "Loaded $($Patterns.Count) exfiltration search patterns" -Level Info
+    return $Patterns
+}
+
+# ============================================================================
+# DOMAIN CONTROLLER REVIEW FUNCTIONS
+# ============================================================================
+
+function Invoke-DCReview {
+    Write-IRLog "========================================" -Level Info
+    Write-IRLog "Starting Domain Controller Review" -Level Info
+    Write-IRLog "========================================" -Level Info
+
+    $DCReport = @()
+    $DCs = Get-ADDomainController -Filter * -ErrorAction SilentlyContinue
+
+    if (-not $DCs) {
+        Write-IRLog "No Domain Controllers found!" -Level Critical
+        return
+    }
+
+    Write-IRLog "Found $($DCs.Count) Domain Controller(s)" -Level Info
+
+    foreach ($DC in $DCs) {
+        Write-IRLog "Reviewing DC: $($DC.HostName)" -Level Info
+
+        $DCStatus = [PSCustomObject]@{
+            DCName = $DC.HostName
+            Site = $DC.Site
+            IPv4Address = $DC.IPv4Address
+            IsGlobalCatalog = $DC.IsGlobalCatalog
+            IsReadOnly = $DC.IsReadOnly
+            OperatingSystem = $DC.OperatingSystem
+            Online = $false
+            ServicesOK = $false
+            ReplicationOK = $false
+            SysvolOK = $false
+            NetlogonOK = $false
+            TimeSkewSeconds = $null
+            SuspiciousTasks = @()
+            SuspiciousServices = @()
+            FailedLogons24h = 0
+            SecurityEvents = @()
+            Issues = @()
+        }
+
+        # Test connectivity
+        if (Test-ComputerConnectivity -ComputerName $DC.HostName) {
+            $DCStatus.Online = $true
+            Write-IRLog "  DC is online" -Level Success
+
+            # Check critical services
+            $DCStatus = Test-DCServices -DC $DC -DCStatus $DCStatus
+
+            # Check replication
+            $DCStatus = Test-DCReplication -DC $DC -DCStatus $DCStatus
+
+            # Check SYSVOL and NETLOGON shares
+            $DCStatus = Test-DCShares -DC $DC -DCStatus $DCStatus
+
+            # Check time synchronization
+            $DCStatus = Test-DCTimeSync -DC $DC -DCStatus $DCStatus
+
+            # Check for suspicious scheduled tasks
+            $DCStatus = Test-DCSuspiciousTasks -DC $DC -DCStatus $DCStatus
+
+            # Check for suspicious services
+            $DCStatus = Test-DCSuspiciousServices -DC $DC -DCStatus $DCStatus
+
+            # Check security events
+            $DCStatus = Get-DCSecurityEvents -DC $DC -DCStatus $DCStatus
+        }
+        else {
+            Write-IRLog "  DC is OFFLINE!" -Level Critical
+            $DCStatus.Issues += "DC is offline/unreachable"
+        }
+
+        $DCReport += $DCStatus
+    }
+
+    # Generate DC Review Report
+    Export-DCReport -DCReport $DCReport
+
+    return $DCReport
+}
+
+function Test-DCServices {
+    param($DC, $DCStatus)
+
+    Write-IRLog "  Checking critical services..." -Level Info
+    $AllServicesOK = $true
+
+    foreach ($ServiceName in $CriticalDCServices) {
+        try {
+            $Service = Get-Service -ComputerName $DC.HostName -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($Service) {
+                if ($Service.Status -ne 'Running') {
+                    Write-IRLog "    Service $ServiceName is $($Service.Status)" -Level Warning
+                    $DCStatus.Issues += "Service $ServiceName is $($Service.Status)"
+                    $AllServicesOK = $false
+                }
+            }
+            else {
+                # Some services may not exist on all DCs
+                if ($ServiceName -in @("NTDS", "DNS", "Netlogon", "KDC")) {
+                    Write-IRLog "    Critical service $ServiceName not found!" -Level Error
+                    $DCStatus.Issues += "Critical service $ServiceName not found"
+                    $AllServicesOK = $false
+                }
+            }
+        }
+        catch {
+            Write-IRLog "    Cannot check service $ServiceName" -Level Warning
+        }
+    }
+
+    $DCStatus.ServicesOK = $AllServicesOK
+    if ($AllServicesOK) {
+        Write-IRLog "    All critical services running" -Level Success
+    }
+
+    return $DCStatus
+}
+
+function Test-DCReplication {
+    param($DC, $DCStatus)
+
+    Write-IRLog "  Checking AD replication..." -Level Info
+
+    try {
+        $ReplStatus = repadmin /showrepl $DC.HostName /csv 2>$null | ConvertFrom-Csv
+        $FailedRepl = $ReplStatus | Where-Object { $_.'Number of Failures' -gt 0 }
+
+        if ($FailedRepl) {
+            $DCStatus.ReplicationOK = $false
+            foreach ($Failure in $FailedRepl) {
+                $Issue = "Replication failure with $($_.'Source DSA') - $($_.'Number of Failures') failures"
+                Write-IRLog "    $Issue" -Level Warning
+                $DCStatus.Issues += $Issue
+            }
+        }
+        else {
+            $DCStatus.ReplicationOK = $true
+            Write-IRLog "    Replication healthy" -Level Success
+        }
+    }
+    catch {
+        Write-IRLog "    Cannot check replication status" -Level Warning
+        $DCStatus.Issues += "Unable to verify replication status"
+    }
+
+    return $DCStatus
+}
+
+function Test-DCShares {
+    param($DC, $DCStatus)
+
+    Write-IRLog "  Checking SYSVOL and NETLOGON shares..." -Level Info
+
+    try {
+        $SysvolPath = "\\$($DC.HostName)\SYSVOL"
+        $NetlogonPath = "\\$($DC.HostName)\NETLOGON"
+
+        if (Test-Path $SysvolPath -ErrorAction SilentlyContinue) {
+            $DCStatus.SysvolOK = $true
+            Write-IRLog "    SYSVOL share accessible" -Level Success
+        }
+        else {
+            $DCStatus.SysvolOK = $false
+            Write-IRLog "    SYSVOL share NOT accessible!" -Level Error
+            $DCStatus.Issues += "SYSVOL share inaccessible"
+        }
+
+        if (Test-Path $NetlogonPath -ErrorAction SilentlyContinue) {
+            $DCStatus.NetlogonOK = $true
+            Write-IRLog "    NETLOGON share accessible" -Level Success
+        }
+        else {
+            $DCStatus.NetlogonOK = $false
+            Write-IRLog "    NETLOGON share NOT accessible!" -Level Error
+            $DCStatus.Issues += "NETLOGON share inaccessible"
+        }
+    }
+    catch {
+        Write-IRLog "    Error checking shares: $_" -Level Warning
+    }
+
+    return $DCStatus
+}
+
+function Test-DCTimeSync {
+    param($DC, $DCStatus)
+
+    Write-IRLog "  Checking time synchronization..." -Level Info
+
+    try {
+        $W32tmOutput = w32tm /stripchart /computer:$($DC.HostName) /samples:1 /dataonly 2>$null
+        if ($W32tmOutput -match '([+-]?\d+\.?\d*)s') {
+            $Skew = [math]::Abs([double]$Matches[1])
+            $DCStatus.TimeSkewSeconds = $Skew
+
+            if ($Skew -gt 300) {
+                Write-IRLog "    CRITICAL time skew: $Skew seconds!" -Level Critical
+                $DCStatus.Issues += "Critical time skew: $Skew seconds (Kerberos may fail)"
+            }
+            elseif ($Skew -gt 60) {
+                Write-IRLog "    Time skew warning: $Skew seconds" -Level Warning
+                $DCStatus.Issues += "Time skew warning: $Skew seconds"
+            }
+            else {
+                Write-IRLog "    Time sync OK (skew: $Skew seconds)" -Level Success
+            }
+        }
+    }
+    catch {
+        Write-IRLog "    Cannot check time sync" -Level Warning
+    }
+
+    return $DCStatus
+}
+
+function Test-DCSuspiciousTasks {
+    param($DC, $DCStatus)
+
+    Write-IRLog "  Checking for suspicious scheduled tasks..." -Level Info
+
+    try {
+        $Tasks = Get-ScheduledTask -CimSession $DC.HostName -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -ne 'Disabled' }
+
+        foreach ($Task in $Tasks) {
+            $TaskInfo = Get-ScheduledTaskInfo -CimSession $DC.HostName -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction SilentlyContinue
+            $Actions = $Task.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }
+
+            foreach ($Action in $Actions) {
+                foreach ($Pattern in $SuspiciousTaskPatterns) {
+                    if ($Action -match $Pattern) {
+                        $SuspiciousTask = @{
+                            TaskName = $Task.TaskName
+                            TaskPath = $Task.TaskPath
+                            Action = $Action
+                            Pattern = $Pattern
+                        }
+                        $DCStatus.SuspiciousTasks += $SuspiciousTask
+                        Write-IRLog "    SUSPICIOUS TASK: $($Task.TaskName) - $Action" -Level Critical
+                    }
+                }
+            }
+        }
+
+        if ($DCStatus.SuspiciousTasks.Count -eq 0) {
+            Write-IRLog "    No suspicious scheduled tasks found" -Level Success
+        }
+    }
+    catch {
+        Write-IRLog "    Cannot enumerate scheduled tasks: $_" -Level Warning
+    }
+
+    return $DCStatus
+}
+
+function Test-DCSuspiciousServices {
+    param($DC, $DCStatus)
+
+    Write-IRLog "  Checking for suspicious services..." -Level Info
+
+    try {
+        $Services = Get-CimInstance -ClassName Win32_Service -ComputerName $DC.HostName -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -eq 'Running' }
+
+        foreach ($Service in $Services) {
+            foreach ($Pattern in $SuspiciousServicePaths) {
+                if ($Service.PathName -match $Pattern) {
+                    $SuspiciousService = @{
+                        ServiceName = $Service.Name
+                        DisplayName = $Service.DisplayName
+                        PathName = $Service.PathName
+                        StartMode = $Service.StartMode
+                        Pattern = $Pattern
+                    }
+                    $DCStatus.SuspiciousServices += $SuspiciousService
+                    Write-IRLog "    SUSPICIOUS SERVICE: $($Service.Name) - $($Service.PathName)" -Level Critical
+                }
+            }
+        }
+
+        if ($DCStatus.SuspiciousServices.Count -eq 0) {
+            Write-IRLog "    No suspicious services found" -Level Success
+        }
+    }
+    catch {
+        Write-IRLog "    Cannot enumerate services: $_" -Level Warning
+    }
+
+    return $DCStatus
+}
+
+function Get-DCSecurityEvents {
+    param($DC, $DCStatus)
+
+    Write-IRLog "  Checking security events (last 24h)..." -Level Info
+
+    try {
+        $StartTime = (Get-Date).AddHours(-24)
+
+        # Check for failed logons (Event ID 4625)
+        $FailedLogons = Get-WinEvent -ComputerName $DC.HostName -FilterHashtable @{
+            LogName = 'Security'
+            Id = 4625
+            StartTime = $StartTime
+        } -MaxEvents 1000 -ErrorAction SilentlyContinue
+
+        $DCStatus.FailedLogons24h = if ($FailedLogons) { $FailedLogons.Count } else { 0 }
+
+        if ($DCStatus.FailedLogons24h -gt 100) {
+            Write-IRLog "    HIGH failed logon count: $($DCStatus.FailedLogons24h)" -Level Warning
+            $DCStatus.Issues += "High failed logon count: $($DCStatus.FailedLogons24h) in 24h"
+        }
+        else {
+            Write-IRLog "    Failed logons (24h): $($DCStatus.FailedLogons24h)" -Level Info
+        }
+
+        # Check for security-critical events
+        $CriticalEventIDs = @(
+            4720,  # User account created
+            4726,  # User account deleted
+            4728,  # Member added to security-enabled global group
+            4732,  # Member added to security-enabled local group
+            4756,  # Member added to security-enabled universal group
+            4738,  # User account changed
+            4724,  # Password reset attempt
+            4768,  # Kerberos TGT requested
+            4769   # Kerberos service ticket requested
+        )
+
+        $SecurityEvents = Get-WinEvent -ComputerName $DC.HostName -FilterHashtable @{
+            LogName = 'Security'
+            Id = $CriticalEventIDs
+            StartTime = $StartTime
+        } -MaxEvents 500 -ErrorAction SilentlyContinue
+
+        if ($SecurityEvents) {
+            $GroupedEvents = $SecurityEvents | Group-Object Id |
+                Select-Object @{N='EventID';E={$_.Name}}, Count |
+                Sort-Object Count -Descending
+
+            $DCStatus.SecurityEvents = $GroupedEvents
+            Write-IRLog "    Security events (24h): $($SecurityEvents.Count) across $($GroupedEvents.Count) event types" -Level Info
+        }
+    }
+    catch {
+        Write-IRLog "    Cannot query security events: $_" -Level Warning
+    }
+
+    return $DCStatus
+}
+
+function Export-DCReport {
+    param($DCReport)
+
+    $ReportFile = Join-Path $OutputPath "$ReportPrefix`_DCReview_$Timestamp.csv"
+
+    $ExportData = foreach ($DC in $DCReport) {
+        [PSCustomObject]@{
+            DCName = $DC.DCName
+            Site = $DC.Site
+            IPv4Address = $DC.IPv4Address
+            IsGlobalCatalog = $DC.IsGlobalCatalog
+            IsReadOnly = $DC.IsReadOnly
+            Online = $DC.Online
+            ServicesOK = $DC.ServicesOK
+            ReplicationOK = $DC.ReplicationOK
+            SysvolOK = $DC.SysvolOK
+            NetlogonOK = $DC.NetlogonOK
+            TimeSkewSeconds = $DC.TimeSkewSeconds
+            SuspiciousTaskCount = $DC.SuspiciousTasks.Count
+            SuspiciousServiceCount = $DC.SuspiciousServices.Count
+            FailedLogons24h = $DC.FailedLogons24h
+            Issues = ($DC.Issues -join "; ")
+        }
+    }
+
+    $ExportData | Export-Csv -Path $ReportFile -NoTypeInformation -Encoding UTF8
+    Write-IRLog "DC Review report saved: $ReportFile" -Level Success
+
+    # Export suspicious findings detail
+    $SuspiciousFindings = @()
+    foreach ($DC in $DCReport) {
+        foreach ($Task in $DC.SuspiciousTasks) {
+            $SuspiciousFindings += [PSCustomObject]@{
+                DCName = $DC.DCName
+                FindingType = "SuspiciousTask"
+                Name = $Task.TaskName
+                Detail = $Task.Action
+                Pattern = $Task.Pattern
+            }
+        }
+        foreach ($Service in $DC.SuspiciousServices) {
+            $SuspiciousFindings += [PSCustomObject]@{
+                DCName = $DC.DCName
+                FindingType = "SuspiciousService"
+                Name = $Service.ServiceName
+                Detail = $Service.PathName
+                Pattern = $Service.Pattern
+            }
+        }
+    }
+
+    if ($SuspiciousFindings.Count -gt 0) {
+        $SuspiciousFile = Join-Path $OutputPath "$ReportPrefix`_DC_SuspiciousFindings_$Timestamp.csv"
+        $SuspiciousFindings | Export-Csv -Path $SuspiciousFile -NoTypeInformation -Encoding UTF8
+        Write-IRLog "Suspicious findings report saved: $SuspiciousFile" -Level Warning
+    }
+}
+
+# ============================================================================
+# IOC SEARCH FUNCTIONS
+# ============================================================================
+
+function Invoke-IOCSearch {
+    param([hashtable]$IOCs)
+
+    Write-IRLog "========================================" -Level Info
+    Write-IRLog "Starting IOC Search" -Level Info
+    Write-IRLog "========================================" -Level Info
+
+    $IOCResults = @()
+
+    # Get target computers
+    $Computers = Get-TargetComputers
+    Write-IRLog "Scanning $($Computers.Count) computer(s) for IOCs" -Level Info
+
+    foreach ($Computer in $Computers) {
+        Write-IRLog "Scanning: $Computer" -Level Info
+
+        if (-not (Test-ComputerConnectivity -ComputerName $Computer)) {
+            if ($IncludeOffline) {
+                $IOCResults += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    IOCType = "N/A"
+                    IOCValue = "N/A"
+                    FoundLocation = "OFFLINE"
+                    Details = "Computer unreachable"
+                }
+            }
+            Write-IRLog "  Computer offline, skipping..." -Level Warning
+            continue
+        }
+
+        # Search for file hash IOCs
+        if ($IOCs.Hashes.Count -gt 0) {
+            $IOCResults += Search-FileHashIOCs -Computer $Computer -Hashes $IOCs.Hashes
+        }
+
+        # Search for IP IOCs in network connections
+        if ($IOCs.IPs.Count -gt 0) {
+            $IOCResults += Search-NetworkIOCs -Computer $Computer -IPs $IOCs.IPs
+        }
+
+        # Search for domain IOCs in DNS cache
+        if ($IOCs.Domains.Count -gt 0) {
+            $IOCResults += Search-DomainIOCs -Computer $Computer -Domains $IOCs.Domains
+        }
+
+        # Search for filename IOCs
+        if ($IOCs.Filenames.Count -gt 0) {
+            $IOCResults += Search-FilenameIOCs -Computer $Computer -Filenames $IOCs.Filenames
+        }
+    }
+
+    # Export IOC results
+    Export-IOCReport -IOCResults $IOCResults
+
+    return $IOCResults
+}
+
+function Get-TargetComputers {
+    if ($TargetComputers -and $TargetComputers.Count -gt 0) {
+        return $TargetComputers
+    }
+
+    # Get all domain computers
+    try {
+        $Computers = Get-ADComputer -Filter { Enabled -eq $true } -Properties OperatingSystem |
+            Where-Object { $_.OperatingSystem -like "*Windows*" } |
+            Select-Object -ExpandProperty Name
+
+        return $Computers
+    }
+    catch {
+        Write-IRLog "Failed to enumerate domain computers: $_" -Level Error
+        return @()
+    }
+}
+
+function Search-FileHashIOCs {
+    param(
+        [string]$Computer,
+        [array]$Hashes
+    )
+
+    $Results = @()
+    Write-IRLog "  Searching for file hash IOCs..." -Level Info
+
+    $SearchPaths = @(
+        "\\$Computer\C$\Windows\Temp",
+        "\\$Computer\C$\Temp",
+        "\\$Computer\C$\Users\Public",
+        "\\$Computer\C$\ProgramData"
+    )
+
+    foreach ($SearchPath in $SearchPaths) {
+        try {
+            if (-not (Test-Path $SearchPath -ErrorAction SilentlyContinue)) { continue }
+
+            $Files = Get-ChildItem -Path $SearchPath -Recurse -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -lt 100MB }
+
+            foreach ($File in $Files) {
+                foreach ($HashEntry in $Hashes) {
+                    $FileHash = Get-FileHashSafe -Path $File.FullName -Algorithm $HashEntry.Type
+                    if ($FileHash -and $FileHash -eq $HashEntry.Value) {
+                        $Results += [PSCustomObject]@{
+                            ComputerName = $Computer
+                            IOCType = "FileHash_$($HashEntry.Type)"
+                            IOCValue = $HashEntry.Value
+                            FoundLocation = $File.FullName
+                            Details = "Size: $($File.Length) bytes, Modified: $($File.LastWriteTime)"
+                        }
+                        Write-IRLog "    FOUND HASH IOC: $($File.FullName)" -Level Critical
+                    }
+                }
+            }
+        }
+        catch {
+            # Silent continue on access errors
+        }
+    }
+
+    return $Results
+}
+
+function Search-NetworkIOCs {
+    param(
+        [string]$Computer,
+        [array]$IPs
+    )
+
+    $Results = @()
+    Write-IRLog "  Searching for network IOCs..." -Level Info
+
+    try {
+        $Connections = Get-NetTCPConnection -CimSession $Computer -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -eq 'Established' -or $_.State -eq 'TimeWait' }
+
+        foreach ($Conn in $Connections) {
+            if ($Conn.RemoteAddress -in $IPs) {
+                $Results += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    IOCType = "NetworkConnection"
+                    IOCValue = $Conn.RemoteAddress
+                    FoundLocation = "RemotePort:$($Conn.RemotePort)"
+                    Details = "LocalPort:$($Conn.LocalPort), State:$($Conn.State), PID:$($Conn.OwningProcess)"
+                }
+                Write-IRLog "    FOUND NETWORK IOC: $($Conn.RemoteAddress):$($Conn.RemotePort)" -Level Critical
+            }
+        }
+    }
+    catch {
+        Write-IRLog "    Cannot check network connections on $Computer" -Level Warning
+    }
+
+    return $Results
+}
+
+function Search-DomainIOCs {
+    param(
+        [string]$Computer,
+        [array]$Domains
+    )
+
+    $Results = @()
+    Write-IRLog "  Searching for domain IOCs in DNS cache..." -Level Info
+
+    try {
+        $DnsCache = Get-DnsClientCache -CimSession $Computer -ErrorAction SilentlyContinue
+
+        foreach ($Entry in $DnsCache) {
+            foreach ($Domain in $Domains) {
+                if ($Entry.Entry -like "*$Domain*") {
+                    $Results += [PSCustomObject]@{
+                        ComputerName = $Computer
+                        IOCType = "DNSCache"
+                        IOCValue = $Domain
+                        FoundLocation = $Entry.Entry
+                        Details = "RecordType:$($Entry.Type), Data:$($Entry.Data), TTL:$($Entry.TimeToLive)"
+                    }
+                    Write-IRLog "    FOUND DOMAIN IOC in DNS: $($Entry.Entry)" -Level Critical
+                }
+            }
+        }
+    }
+    catch {
+        Write-IRLog "    Cannot check DNS cache on $Computer" -Level Warning
+    }
+
+    return $Results
+}
+
+function Search-FilenameIOCs {
+    param(
+        [string]$Computer,
+        [array]$Filenames
+    )
+
+    $Results = @()
+    Write-IRLog "  Searching for filename IOCs..." -Level Info
+
+    $SearchPaths = @(
+        "\\$Computer\C$\Windows\Temp",
+        "\\$Computer\C$\Temp",
+        "\\$Computer\C$\Users",
+        "\\$Computer\C$\ProgramData",
+        "\\$Computer\C$\Windows\System32"
+    )
+
+    foreach ($SearchPath in $SearchPaths) {
+        try {
+            if (-not (Test-Path $SearchPath -ErrorAction SilentlyContinue)) { continue }
+
+            $Files = Get-ChildItem -Path $SearchPath -Recurse -File -Force -Depth $ScanDepth -ErrorAction SilentlyContinue
+
+            foreach ($File in $Files) {
+                foreach ($Filename in $Filenames) {
+                    if ($File.Name -like $Filename -or $File.Name -match [regex]::Escape($Filename)) {
+                        $Results += [PSCustomObject]@{
+                            ComputerName = $Computer
+                            IOCType = "Filename"
+                            IOCValue = $Filename
+                            FoundLocation = $File.FullName
+                            Details = "Size: $($File.Length) bytes, Created: $($File.CreationTime), Modified: $($File.LastWriteTime)"
+                        }
+                        Write-IRLog "    FOUND FILENAME IOC: $($File.FullName)" -Level Critical
+                    }
+                }
+            }
+        }
+        catch {
+            # Silent continue
+        }
+    }
+
+    return $Results
+}
+
+function Export-IOCReport {
+    param($IOCResults)
+
+    $ReportFile = Join-Path $OutputPath "$ReportPrefix`_IOCSearch_$Timestamp.csv"
+
+    if ($IOCResults.Count -gt 0) {
+        $IOCResults | Export-Csv -Path $ReportFile -NoTypeInformation -Encoding UTF8
+        Write-IRLog "IOC Search report saved: $ReportFile" -Level Success
+        Write-IRLog "Total IOC matches found: $($IOCResults.Count)" -Level Warning
+    }
+    else {
+        Write-IRLog "No IOC matches found" -Level Success
+        "No IOC matches found during scan at $Timestamp" | Out-File $ReportFile
+    }
+}
+
+# ============================================================================
+# EXFILTRATION SEARCH FUNCTIONS
+# ============================================================================
+
+function Invoke-ExfilSearch {
+    param([array]$Patterns)
+
+    Write-IRLog "========================================" -Level Info
+    Write-IRLog "Starting Exfiltration Data Search" -Level Info
+    Write-IRLog "========================================" -Level Info
+
+    $ExfilResults = @()
+
+    # Get target computers
+    $Computers = Get-TargetComputers
+    Write-IRLog "Scanning $($Computers.Count) computer(s) for potential exfiltrated data" -Level Info
+    Write-IRLog "Search patterns: $($Patterns.Count)" -Level Info
+
+    foreach ($Computer in $Computers) {
+        Write-IRLog "Scanning: $Computer" -Level Info
+
+        if (-not (Test-ComputerConnectivity -ComputerName $Computer)) {
+            if ($IncludeOffline) {
+                $ExfilResults += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    MatchType = "N/A"
+                    Pattern = "N/A"
+                    FilePath = "OFFLINE"
+                    FileSize = 0
+                    Created = $null
+                    Modified = $null
+                    Details = "Computer unreachable"
+                }
+            }
+            Write-IRLog "  Computer offline, skipping..." -Level Warning
+            continue
+        }
+
+        # Search staging directories for pattern matches
+        $ExfilResults += Search-ExfilPatterns -Computer $Computer -Patterns $Patterns
+
+        # Search for large archive files in staging locations
+        $ExfilResults += Search-ExfilArchives -Computer $Computer
+
+        # Check for recently modified sensitive files
+        $ExfilResults += Search-RecentSensitiveFiles -Computer $Computer -Patterns $Patterns
+    }
+
+    # Export exfiltration search results
+    Export-ExfilReport -ExfilResults $ExfilResults
+
+    return $ExfilResults
+}
+
+function Search-ExfilPatterns {
+    param(
+        [string]$Computer,
+        [array]$Patterns
+    )
+
+    $Results = @()
+    Write-IRLog "  Searching for exfiltration patterns in files..." -Level Info
+
+    $SearchPaths = @(
+        "\\$Computer\C$\Windows\Temp",
+        "\\$Computer\C$\Temp",
+        "\\$Computer\C$\PerfLogs",
+        "\\$Computer\C$\Users\Public",
+        "\\$Computer\C$\ProgramData"
+    )
+
+    foreach ($SearchPath in $SearchPaths) {
+        try {
+            if (-not (Test-Path $SearchPath -ErrorAction SilentlyContinue)) { continue }
+
+            $Files = Get-ChildItem -Path $SearchPath -Recurse -File -Force -Depth $ScanDepth -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -lt 50MB -and $_.Extension -in @('.txt', '.csv', '.log', '.xml', '.json', '.sql', '.xlsx', '.docx') }
+
+            foreach ($File in $Files) {
+                foreach ($Pattern in $Patterns) {
+                    try {
+                        $Content = Get-Content -Path $File.FullName -TotalCount 1000 -ErrorAction SilentlyContinue
+                        if ($Content -match $Pattern) {
+                            $Results += [PSCustomObject]@{
+                                ComputerName = $Computer
+                                MatchType = "ContentPattern"
+                                Pattern = $Pattern
+                                FilePath = $File.FullName
+                                FileSize = $File.Length
+                                Created = $File.CreationTime
+                                Modified = $File.LastWriteTime
+                                Details = "Pattern found in file content"
+                            }
+                            Write-IRLog "    FOUND PATTERN: $Pattern in $($File.FullName)" -Level Warning
+                            break  # Only report once per file
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch {
+            # Silent continue
+        }
+    }
+
+    return $Results
+}
+
+function Search-ExfilArchives {
+    param([string]$Computer)
+
+    $Results = @()
+    Write-IRLog "  Searching for suspicious archive files..." -Level Info
+
+    foreach ($StagingDir in $ExfilStagingDirs) {
+        $RemotePath = $StagingDir -replace '^C:', "\\$Computer\C$"
+
+        try {
+            if (-not (Test-Path $RemotePath -ErrorAction SilentlyContinue)) { continue }
+
+            # Find large archive files (potential staged exfil data)
+            $Archives = Get-ChildItem -Path $RemotePath -Recurse -File -Force -Depth 3 -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Extension -in $ExfilExtensions -and
+                    $_.Length -gt 10MB  # Suspicious if large archive in staging location
+                }
+
+            foreach ($Archive in $Archives) {
+                $Results += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    MatchType = "SuspiciousArchive"
+                    Pattern = $Archive.Extension
+                    FilePath = $Archive.FullName
+                    FileSize = $Archive.Length
+                    Created = $Archive.CreationTime
+                    Modified = $Archive.LastWriteTime
+                    Details = "Large archive in staging directory ($('{0:N2}' -f ($Archive.Length / 1MB)) MB)"
+                }
+                Write-IRLog "    SUSPICIOUS ARCHIVE: $($Archive.FullName) ($('{0:N2}' -f ($Archive.Length / 1MB)) MB)" -Level Warning
+            }
+        }
+        catch {
+            # Silent continue
+        }
+    }
+
+    return $Results
+}
+
+function Search-RecentSensitiveFiles {
+    param(
+        [string]$Computer,
+        [array]$Patterns
+    )
+
+    $Results = @()
+    Write-IRLog "  Searching for recently modified sensitive files..." -Level Info
+
+    $CutoffTime = (Get-Date).AddDays(-7)  # Files modified in last 7 days
+
+    $SensitivePaths = @(
+        "\\$Computer\C$\Users",
+        "\\$Computer\C$\ProgramData"
+    )
+
+    $SensitiveExtensions = @('.pst', '.ost', '.kdbx', '.key', '.pem', '.pfx', '.sql', '.bak', '.mdb')
+
+    foreach ($SearchPath in $SensitivePaths) {
+        try {
+            if (-not (Test-Path $SearchPath -ErrorAction SilentlyContinue)) { continue }
+
+            $SensitiveFiles = Get-ChildItem -Path $SearchPath -Recurse -File -Force -Depth $ScanDepth -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Extension -in $SensitiveExtensions -and
+                    $_.LastWriteTime -gt $CutoffTime
+                }
+
+            foreach ($File in $SensitiveFiles) {
+                $Results += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    MatchType = "RecentSensitiveFile"
+                    Pattern = $File.Extension
+                    FilePath = $File.FullName
+                    FileSize = $File.Length
+                    Created = $File.CreationTime
+                    Modified = $File.LastWriteTime
+                    Details = "Recently modified sensitive file type"
+                }
+                Write-IRLog "    RECENT SENSITIVE FILE: $($File.FullName)" -Level Warning
+            }
+        }
+        catch {
+            # Silent continue
+        }
+    }
+
+    # Also search for files matching patterns by name
+    foreach ($Pattern in $Patterns) {
+        foreach ($SearchPath in $SensitivePaths) {
+            try {
+                if (-not (Test-Path $SearchPath -ErrorAction SilentlyContinue)) { continue }
+
+                $MatchingFiles = Get-ChildItem -Path $SearchPath -Recurse -File -Force -Depth $ScanDepth -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match $Pattern }
+
+                foreach ($File in $MatchingFiles) {
+                    $Results += [PSCustomObject]@{
+                        ComputerName = $Computer
+                        MatchType = "FilenamePattern"
+                        Pattern = $Pattern
+                        FilePath = $File.FullName
+                        FileSize = $File.Length
+                        Created = $File.CreationTime
+                        Modified = $File.LastWriteTime
+                        Details = "Filename matches search pattern"
+                    }
+                    Write-IRLog "    FILENAME MATCH: $($File.FullName) (pattern: $Pattern)" -Level Warning
+                }
+            }
+            catch {
+                # Silent continue
+            }
+        }
+    }
+
+    return $Results
+}
+
+function Export-ExfilReport {
+    param($ExfilResults)
+
+    $ReportFile = Join-Path $OutputPath "$ReportPrefix`_ExfilSearch_$Timestamp.csv"
+
+    if ($ExfilResults.Count -gt 0) {
+        $ExfilResults | Export-Csv -Path $ReportFile -NoTypeInformation -Encoding UTF8
+        Write-IRLog "Exfiltration Search report saved: $ReportFile" -Level Success
+        Write-IRLog "Total potential exfiltration indicators found: $($ExfilResults.Count)" -Level Warning
+
+        # Summary by type
+        $Summary = $ExfilResults | Group-Object MatchType | Select-Object Name, Count
+        foreach ($Type in $Summary) {
+            Write-IRLog "  - $($Type.Name): $($Type.Count) findings" -Level Info
+        }
+    }
+    else {
+        Write-IRLog "No exfiltration indicators found" -Level Success
+        "No exfiltration indicators found during scan at $Timestamp" | Out-File $ReportFile
+    }
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "  IR RECOVERY UTILITY - Incident Response & Threat Hunting" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Initialize environment
+Initialize-IREnvironment
+
+# Validate required parameters based on mode
+if ($Mode -in @("IOCSearch", "Full") -and -not $IOCFile) {
+    Write-IRLog "IOCFile parameter required for IOCSearch or Full mode" -Level Error
+    exit 1
+}
+
+if ($Mode -in @("ExfilSearch", "Full") -and -not $ExfilPatternsFile) {
+    Write-IRLog "ExfilPatternsFile parameter required for ExfilSearch or Full mode" -Level Error
+    exit 1
+}
+
+# Parse input files if needed
+$IOCs = $null
+$ExfilPatterns = $null
+
+if ($Mode -in @("IOCSearch", "Full")) {
+    $IOCs = Parse-IOCFile -FilePath $IOCFile
+    if (-not $IOCs) { exit 1 }
+}
+
+if ($Mode -in @("ExfilSearch", "Full")) {
+    $ExfilPatterns = Parse-ExfilPatternsFile -FilePath $ExfilPatternsFile
+    if (-not $ExfilPatterns) { exit 1 }
+}
+
+# Execute based on mode
+$Results = @{
+    DCReview = $null
+    IOCSearch = $null
+    ExfilSearch = $null
+}
+
+switch ($Mode) {
+    "DCReview" {
+        $Results.DCReview = Invoke-DCReview
+    }
+    "IOCSearch" {
+        $Results.IOCSearch = Invoke-IOCSearch -IOCs $IOCs
+    }
+    "ExfilSearch" {
+        $Results.ExfilSearch = Invoke-ExfilSearch -Patterns $ExfilPatterns
+    }
+    "Full" {
+        Write-IRLog "Running FULL IR Recovery Assessment" -Level Info
+        $Results.DCReview = Invoke-DCReview
+        $Results.IOCSearch = Invoke-IOCSearch -IOCs $IOCs
+        $Results.ExfilSearch = Invoke-ExfilSearch -Patterns $ExfilPatterns
+    }
+}
+
+# Summary
+Write-Host ""
+Write-IRLog "========================================" -Level Info
+Write-IRLog "IR Recovery Utility Complete" -Level Success
+Write-IRLog "========================================" -Level Info
+Write-IRLog "Reports saved to: $OutputPath" -Level Info
+Write-IRLog "Log file: $($script:LogFile)" -Level Info
+
+if ($Results.DCReview) {
+    $DCIssues = ($Results.DCReview | Where-Object { $_.Issues.Count -gt 0 }).Count
+    Write-IRLog "DC Review: $($Results.DCReview.Count) DCs checked, $DCIssues with issues" -Level $(if ($DCIssues -gt 0) { "Warning" } else { "Success" })
+}
+
+if ($Results.IOCSearch) {
+    $IOCMatches = ($Results.IOCSearch | Where-Object { $_.IOCType -ne "N/A" }).Count
+    Write-IRLog "IOC Search: $IOCMatches matches found" -Level $(if ($IOCMatches -gt 0) { "Critical" } else { "Success" })
+}
+
+if ($Results.ExfilSearch) {
+    $ExfilFindings = ($Results.ExfilSearch | Where-Object { $_.MatchType -ne "N/A" }).Count
+    Write-IRLog "Exfil Search: $ExfilFindings potential indicators found" -Level $(if ($ExfilFindings -gt 0) { "Warning" } else { "Success" })
+}
+
+Write-Host ""

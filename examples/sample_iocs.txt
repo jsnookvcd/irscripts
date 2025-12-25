@@ -1,0 +1,73 @@
+# IR Recovery Utility - Sample IOC File
+# Lines starting with # are comments and will be ignored
+# Blank lines are also ignored
+#
+# Supported IOC types:
+# - MD5 hashes (32 hex characters)
+# - SHA1 hashes (40 hex characters)
+# - SHA256 hashes (64 hex characters)
+# - IP addresses (IPv4 format)
+# - Domain names
+# - Filenames/patterns
+
+# ============================================================================
+# EXAMPLE FILE HASHES (Replace with actual IOCs from threat intelligence)
+# ============================================================================
+
+# MD5 Hashes
+d41d8cd98f00b204e9800998ecf8427e
+098f6bcd4621d373cade4e832627b4f6
+
+# SHA1 Hashes
+da39a3ee5e6b4b0d3255bfef95601890afd80709
+a94a8fe5ccb19ba61c4c0873d391e987982fbbd3
+
+# SHA256 Hashes
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+# ============================================================================
+# NETWORK INDICATORS
+# ============================================================================
+
+# Known malicious IPs (examples - replace with actual threat intel)
+192.168.100.100
+10.0.0.50
+203.0.113.50
+
+# Known malicious domains
+evil-domain.com
+malware-c2.net
+data-exfil.xyz
+suspicious-site.org
+
+# ============================================================================
+# MALICIOUS FILENAMES
+# ============================================================================
+
+# Common ransomware/malware filenames
+mimikatz.exe
+lazagne.exe
+procdump.exe
+psexec.exe
+cobalt*.exe
+beacon.exe
+payload.exe
+shell.exe
+backdoor.exe
+
+# Suspicious script names
+invoke-*.ps1
+powercat.ps1
+nishang*.ps1
+empire*.ps1
+
+# Common webshells
+*.aspx
+*.php
+*.jsp
+
+# Ransomware notes (if not using dedicated ransomware scanner)
+README.txt
+DECRYPT*.txt
+HOW_TO_RECOVER*.txt
