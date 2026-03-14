@@ -1108,6 +1108,9 @@ class TenantInvestigator:
             ("Privileged Access Groups", self.get_privileged_access_groups),
             ("Access Reviews", self.get_access_reviews),
             ("Mailbox Audit Bypass", self.get_mailbox_audit_bypass),
+            ("Purview Audit Log (MailItemsAccessed)", self.get_purview_mail_items_accessed),
+            ("Service Principal Risk Detections", self.get_sp_risk_detections),
+            ("CAE Policy Status", self.get_cae_policy),
         ]
 
         for i, (label, func) in enumerate(steps, 1):
@@ -2010,6 +2013,28 @@ class TenantInvestigator:
                     "accountEnabled": u.get("accountEnabled"),
                 } for u in sync_users], "Tenant", investigate=True)
 
+            # Get detailed sync configuration (feature flags)
+            sync_config = self.graph.get("directory/onPremisesSynchronization")
+            if sync_config and "value" in sync_config:
+                for sc in sync_config["value"]:
+                    features = sc.get("features", {})
+                    config_section = sc.get("configuration", {})
+                    feature_data = [{
+                        "passwordSyncEnabled": features.get("passwordSyncEnabled"),
+                        "passwordWritebackEnabled": features.get("passwordWritebackEnabled"),
+                        "deviceWritebackEnabled": features.get("deviceWritebackEnabled"),
+                        "groupWriteBackEnabled": features.get("groupWriteBackEnabled"),
+                        "blockSoftMatchEnabled": features.get("blockSoftMatchEnabled"),
+                        "blockCloudObjectTakeoverThroughHardMatch": features.get("blockCloudObjectTakeoverThroughHardMatchEnabled"),
+                        "synchronizeUpnForManagedUsers": features.get("synchronizeUpnForManagedUsersEnabled"),
+                        "accidentalDeletionThreshold": config_section.get("accidentalDeletionPrevention", {}).get("alertThreshold"),
+                    }]
+                    self.exporter.export("DirectorySyncConfiguration", feature_data, "Tenant")
+
+                    if features.get("passwordWritebackEnabled"):
+                        log.investigate("Password writeback is enabled - bidirectional credential flow risk",
+                                        mitre_ids=["T1556.007"])
+
     def get_managed_identities(self):
         log.info("=== Collecting Managed Identity Service Principals ===")
         managed = self.graph.get_all(
@@ -2247,6 +2272,115 @@ class TenantInvestigator:
                 mitre_ids=["T1562.008"]
             )
 
+    def get_purview_mail_items_accessed(self):
+        log.info("=== Querying Purview Audit Log: MailItemsAccessed (E5 required) ===")
+        # Use the new Graph-based Purview audit log API (beta)
+        # This creates an async query and polls for results
+        query_body = {
+            "displayName": f"VCD_MailItemsAccessed_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            "filterStartDateTime": self.start_date.isoformat(),
+            "filterEndDateTime": self.end_date.isoformat(),
+            "operationFilters": ["MailItemsAccessed"],
+        }
+
+        try:
+            # Create the audit log query
+            result = None
+            headers = self.graph._headers()
+            url = f"{GRAPH_BETA}/security/auditLog/queries"
+            resp = requests.post(url, headers=headers, json=query_body, timeout=60)
+
+            if resp.status_code in (201, 200):
+                result = resp.json()
+                query_id = result.get("id")
+                log.info(f"Purview audit query created: {query_id}")
+
+                # Poll for completion (max 60 seconds)
+                for _ in range(12):
+                    time.sleep(5)
+                    status_resp = self.graph.get(f"security/auditLog/queries/{query_id}", beta=True)
+                    if not status_resp:
+                        break
+                    state = status_resp.get("status", "")
+                    if state == "succeeded":
+                        # Fetch results
+                        records = self.graph.get_all(
+                            f"security/auditLog/queries/{query_id}/records",
+                            beta=True, max_records=5000,
+                        )
+                        if records:
+                            mail_data = [{
+                                "createdDateTime": r.get("createdDateTime"),
+                                "operation": r.get("operation"),
+                                "userId": r.get("userId"),
+                                "userPrincipalName": r.get("userPrincipalName"),
+                                "clientIP": r.get("clientIP"),
+                                "objectId": r.get("objectId", "")[:200],
+                                "auditData": json.dumps(r.get("auditData", {}), default=str)[:500],
+                            } for r in records]
+
+                            self.exporter.export("MailItemsAccessed", mail_data, "Tenant", investigate=True)
+                            log.investigate(
+                                f"Found {len(mail_data)} MailItemsAccessed event(s) via Purview API",
+                                mitre_ids=["T1114.002"]
+                            )
+                        break
+                    elif state == "failed":
+                        log.warn("Purview audit query failed (may require E5 license)")
+                        break
+            elif resp.status_code == 403:
+                log.warn("Purview Audit API: 403 Forbidden (requires AuditLogsQuery.Read.All permission and E5 license)")
+            else:
+                log.warn(f"Purview Audit API returned {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            log.warn(f"Purview Audit Log query failed (E5 may be required): {e}")
+
+    def get_sp_risk_detections(self):
+        log.info("=== Collecting Service Principal Risk Detections ===")
+        detections = self.graph.get_all("identityProtection/servicePrincipalRiskDetections")
+        if not detections:
+            log.info("No service principal risk detections found")
+            return
+
+        det_data = [{
+            "id": d.get("id"),
+            "appId": d.get("appId"),
+            "servicePrincipalDisplayName": d.get("servicePrincipalDisplayName"),
+            "riskEventType": d.get("riskEventType"),
+            "riskLevel": d.get("riskLevel"),
+            "riskState": d.get("riskState"),
+            "riskDetail": d.get("riskDetail"),
+            "detectedDateTime": d.get("detectedDateTime"),
+            "ipAddress": d.get("ipAddress"),
+            "source": d.get("source"),
+            "detectionTimingType": d.get("detectionTimingType"),
+            "keyIds": "; ".join(d.get("keyIds", [])),
+        } for d in detections]
+
+        self.exporter.export("ServicePrincipalRiskDetections", det_data, "Tenant", investigate=True)
+        log.investigate(
+            f"Found {len(det_data)} service principal risk detection(s)",
+            mitre_ids=["T1098.001"]
+        )
+
+    def get_cae_policy(self):
+        log.info("=== Collecting Continuous Access Evaluation (CAE) Policy ===")
+        cae = self.graph.get("identity/continuousAccessEvaluationPolicy", beta=True)
+        if not cae:
+            return
+
+        cae_data = [{
+            "description": cae.get("description"),
+            "isEnabled": cae.get("isEnabled"),
+            "migrate": cae.get("migrate"),
+        }]
+
+        self.exporter.export("CAE_Policy", cae_data, "Tenant")
+
+        if not cae.get("isEnabled"):
+            log.investigate("Continuous Access Evaluation (CAE) is NOT enabled - tokens cannot be revoked in real-time",
+                            mitre_ids=["T1550.001"])
+
 
 # ============================================================================
 # USER INVESTIGATION
@@ -2430,6 +2564,18 @@ class UserInvestigator:
             status = si.get("status", {})
             device = si.get("deviceDetail", {})
 
+            # Extract CAE and token protection status from auth processing details
+            auth_details = si.get("authenticationProcessingDetails", [])
+            is_cae = ""
+            token_protection = ""
+            for detail in (auth_details if isinstance(auth_details, list) else []):
+                if isinstance(detail, dict):
+                    key = detail.get("key", "")
+                    if key == "Is CAE Token":
+                        is_cae = detail.get("value", "")
+                    elif key == "Token Protection - Sign In Session":
+                        token_protection = detail.get("value", "")
+
             si_data.append({
                 "createdDateTime": si.get("createdDateTime"),
                 "userPrincipalName": si.get("userPrincipalName"),
@@ -2448,6 +2594,12 @@ class UserInvestigator:
                 "deviceOS": device.get("operatingSystem"),
                 "deviceBrowser": device.get("browser"),
                 "correlationId": si.get("correlationId"),
+                "isCAEToken": is_cae,
+                "tokenProtection": token_protection,
+                "tokenIssuerType": si.get("tokenIssuerType"),
+                "authenticationRequirement": si.get("authenticationRequirement"),
+                "homeTenantId": si.get("homeTenantId"),
+                "resourceTenantId": si.get("resourceTenantId"),
             })
 
         self.exporter.export("SignInLogs", si_data, self.user_folder)
