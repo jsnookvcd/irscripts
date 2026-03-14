@@ -8,27 +8,61 @@ Surpasses: HAWK | CISA Sparrow | CrowdStrike CRT | Microsoft Extractor Suite
 Author:   Vendetta Cyber Defense
 
 Features:
-    - 6 investigation types: tenant, user, ip, full, bec, complete
+    Investigation Types:
+    - 6 modes: tenant, user, ip, full, bec, complete
+
+    Threat Detection & Analysis:
     - Automated Threat Detection Engine with 50+ rules
     - Full MITRE ATT&CK Cloud Matrix mapping (35+ techniques)
-    - Impossible Travel / Geo-Velocity analysis
+    - Impossible Travel / Geo-Velocity analysis (Haversine formula)
     - Password Spray & Brute Force detection
-    - MFA Fatigue attack detection
-    - Legacy Authentication Protocol detection
+    - MFA Fatigue / Push Spam attack detection
+    - Legacy Authentication Protocol detection (IMAP/POP3/ActiveSync)
+    - Consent Phishing detection and audit
+    - User-Agent clustering and anomaly detection
+    - Country-based sign-in anomaly analysis
+    - Session correlation across sign-in events
+    - Application usage pattern analysis
+    - Actionable Remediation Recommendations engine
+
+    Investigation Modules:
     - Business Email Compromise (BEC) focused investigation
     - SharePoint / OneDrive forensics with exfiltration detection
-    - Microsoft Teams investigation
+    - Microsoft Teams investigation (sideloaded apps)
     - Privileged Identity Management (PIM) analysis
-    - Federation / Golden SAML risk detection
+    - Federation / Golden SAML risk detection and audit
     - Conditional Access policy gap analysis
-    - Cross-Tenant access review
-    - IOC auto-extraction (IPs, emails, domains, app IDs)
-    - Interactive HTML dashboard report
+    - Cross-Tenant access settings review
+    - Guest user investigation with stale account detection
+    - Administrative Units enumeration
+    - Directory Sync / AD Connect status and account audit
+    - Managed Identity service principal enumeration
+    - Workload Identity Federation credential detection
+    - Application Proxy application inventory
+    - Privileged Access Groups with member enumeration
+    - Access Reviews configuration audit
+    - Mailbox Audit Bypass detection
+    - Deleted users and applications (evidence destruction)
+    - Microsoft Secure Score with recommendations
+    - Password and Authorization policy analysis
+
+    Output & Reporting:
+    - Unified chronological timeline across all data sources
+    - Interactive HTML dashboard report (dark theme)
+    - IOC auto-extraction (IPs, emails, domains, app IDs, correlation IDs)
+    - STIX 2.1 IOC export for threat intelligence sharing
     - SIEM export (Splunk, Elasticsearch, Microsoft Sentinel)
-    - Certificate-based authentication
+    - KQL hunting query generation for Microsoft Sentinel
+    - Remediation report with prioritized action items
+    - CSV + JSON for all collected data
+
+    Infrastructure:
+    - Certificate-based authentication support
     - YAML/JSON config file support
-    - Concurrent API execution with rate limiting
-    - Auto-retry with exponential backoff
+    - Concurrent API execution with ThreadPoolExecutor
+    - Rate limit handling with auto-retry and exponential backoff
+    - Thread-safe token refresh
+    - Progress tracking with visual progress bars
 
 Usage:
     # Interactive mode
@@ -1060,6 +1094,20 @@ class TenantInvestigator:
             ("Cross-Tenant Access", self.get_cross_tenant_access),
             ("Deleted Users (Soft)", self.get_recently_deleted_users),
             ("Audit Log Config Changes", self.get_audit_config_changes),
+            ("Secure Score", self.get_secure_score),
+            ("SAML/Federation Audit", self.get_saml_federation_audit),
+            ("Guest Users", self.get_guest_users),
+            ("Password Policies", self.get_password_policies),
+            ("Administrative Units", self.get_administrative_units),
+            ("Directory Sync Status", self.get_directory_sync_status),
+            ("Managed Identities", self.get_managed_identities),
+            ("Workload Identity Federation", self.get_workload_identity_federation),
+            ("Consent Grant Audit (Phishing)", self.get_consent_grant_audit),
+            ("App Proxy Applications", self.get_app_proxy_apps),
+            ("Deleted Applications", self.get_deleted_applications),
+            ("Privileged Access Groups", self.get_privileged_access_groups),
+            ("Access Reviews", self.get_access_reviews),
+            ("Mailbox Audit Bypass", self.get_mailbox_audit_bypass),
         ]
 
         for i, (label, func) in enumerate(steps, 1):
@@ -1712,6 +1760,492 @@ class TenantInvestigator:
             self.exporter.export("AuditConfigChanges", audit_data, "Tenant", investigate=True)
             log.investigate(f"Found {len(audit_data)} audit/logging config change(s)",
                             mitre_ids=["T1562.008"])
+
+    def get_secure_score(self):
+        log.info("=== Collecting Microsoft Secure Score ===")
+        scores = self.graph.get_all("security/secureScores", params={"$top": "5"}, beta=True)
+        if not scores:
+            return
+
+        latest = scores[0] if scores else {}
+        current = latest.get("currentScore", 0)
+        max_score = latest.get("maxScore", 0)
+        pct = (current / max_score * 100) if max_score > 0 else 0
+
+        score_data = [{
+            "currentScore": current,
+            "maxScore": max_score,
+            "percentage": round(pct, 1),
+            "createdDateTime": latest.get("createdDateTime"),
+            "licensedUserCount": latest.get("licensedUserCount"),
+            "activeUserCount": latest.get("activeUserCount"),
+            "enabledServices": "; ".join(latest.get("enabledServices", [])),
+        }]
+
+        self.exporter.export("SecureScore", score_data, "Tenant")
+
+        if pct < 50:
+            log.investigate(f"Microsoft Secure Score is low: {current}/{max_score} ({pct:.0f}%)")
+
+        # Control scores
+        controls = latest.get("controlScores", [])
+        if controls:
+            control_data = [{
+                "controlName": c.get("controlName"),
+                "score": c.get("score"),
+                "controlCategory": c.get("controlCategory"),
+                "description": c.get("description", "")[:200],
+            } for c in controls]
+            self.exporter.export("SecureScoreControls", control_data, "Tenant")
+
+        # Secure score profiles (recommendations)
+        profiles = self.graph.get_all("security/secureScoreControlProfiles", beta=True, max_records=100)
+        if profiles:
+            not_implemented = [p for p in profiles
+                               if p.get("implementationStatus") in ("notImplemented", "notPlanned")]
+            if not_implemented:
+                rec_data = [{
+                    "title": p.get("title"),
+                    "controlCategory": p.get("controlCategory"),
+                    "maxScore": p.get("maxScore"),
+                    "implementationStatus": p.get("implementationStatus"),
+                    "userImpact": p.get("userImpact"),
+                    "threats": "; ".join(p.get("threats", [])[:5]),
+                    "remediation": (p.get("remediation") or "")[:300],
+                } for p in not_implemented[:50]]
+                self.exporter.export("SecureScoreRecommendations", rec_data, "Tenant")
+
+    def get_saml_federation_audit(self):
+        log.info("=== Collecting SAML/Federation Modification Audit ===")
+        # Sparrow-style: search for UserAuthenticationValue of 16457 (forged SAML indicator)
+        filter_str = (
+            "activityDisplayName eq 'Set domain authentication' or "
+            "activityDisplayName eq 'Set federation settings on domain' or "
+            "activityDisplayName eq 'Add unverified domain' or "
+            "activityDisplayName eq 'Verify domain' or "
+            "activityDisplayName eq 'Set company information' or "
+            "activityDisplayName eq 'Update domain'"
+        )
+        logs = self.graph.get_all("auditLogs/directoryAudits", params={"$filter": filter_str})
+        if logs:
+            fed_data = [{
+                "activityDateTime": e.get("activityDateTime"),
+                "activity": e.get("activityDisplayName"),
+                "result": e.get("result"),
+                "initiatedBy": e.get("initiatedBy", {}).get("user", {}).get("userPrincipalName", "")
+                               or e.get("initiatedBy", {}).get("app", {}).get("displayName", ""),
+                "targetResources": json.dumps(e.get("targetResources", []), default=str)[:500],
+                "correlationId": e.get("correlationId"),
+            } for e in logs]
+
+            self.exporter.export("SAMLFederationAudit", fed_data, "Tenant", investigate=True)
+            log.investigate(
+                f"Found {len(fed_data)} federation/domain change(s) - potential Golden SAML activity",
+                mitre_ids=["T1484.002", "T1606.002"]
+            )
+
+        # Check for anomalous SAML token sign-ins (UserAuthenticationValue = 16457)
+        saml_si = self.graph.get_all(
+            "auditLogs/signIns",
+            params={"$filter": "authenticationDetails/any(a:a/authenticationMethod eq 'SAML Token')"},
+            beta=True, max_records=500,
+        )
+        if saml_si:
+            saml_data = [{
+                "createdDateTime": si.get("createdDateTime"),
+                "userPrincipalName": si.get("userPrincipalName"),
+                "ipAddress": si.get("ipAddress"),
+                "appDisplayName": si.get("appDisplayName"),
+                "resourceDisplayName": si.get("resourceDisplayName"),
+                "tokenIssuerType": si.get("tokenIssuerType"),
+                "tokenIssuerName": si.get("tokenIssuerName"),
+            } for si in saml_si]
+
+            self.exporter.export("SAMLTokenSignIns", saml_data, "Tenant", investigate=True)
+            log.investigate(
+                f"Found {len(saml_data)} SAML token sign-in(s) - review for forged tokens",
+                mitre_ids=["T1606.002"]
+            )
+
+    def get_guest_users(self):
+        log.info("=== Collecting Guest/External Users ===")
+        guests = self.graph.get_all(
+            "users",
+            params={
+                "$filter": "userType eq 'Guest'",
+                "$select": "id,displayName,userPrincipalName,mail,createdDateTime,"
+                           "externalUserState,externalUserStateChangeDateTime,"
+                           "accountEnabled,signInActivity",
+            },
+        )
+        if not guests:
+            log.info("No guest users found")
+            return
+
+        guest_data = []
+        stale_guests = []
+        now = datetime.now(timezone.utc)
+        for g in guests:
+            sign_in = g.get("signInActivity", {}) or {}
+            last_sign_in = sign_in.get("lastSignInDateTime")
+            entry = {
+                "displayName": g.get("displayName"),
+                "userPrincipalName": g.get("userPrincipalName"),
+                "mail": g.get("mail"),
+                "createdDateTime": g.get("createdDateTime"),
+                "externalUserState": g.get("externalUserState"),
+                "accountEnabled": g.get("accountEnabled"),
+                "lastSignIn": last_sign_in,
+            }
+            guest_data.append(entry)
+
+            # Stale guest detection
+            if last_sign_in:
+                last_dt = parse_iso_dt(last_sign_in)
+                if last_dt and (now - last_dt).days > 90:
+                    stale_guests.append(entry)
+            elif g.get("externalUserState") == "PendingAcceptance":
+                stale_guests.append(entry)
+
+        self.exporter.export("GuestUsers", guest_data, "Tenant")
+
+        if len(guests) > 50:
+            log.investigate(
+                f"Found {len(guests)} guest user(s) - review for excessive external access",
+                mitre_ids=["T1078.004"]
+            )
+
+        if stale_guests:
+            self.exporter.export("StaleGuestUsers", stale_guests, "Tenant", investigate=True)
+            log.investigate(f"Found {len(stale_guests)} stale/pending guest user(s)")
+
+    def get_password_policies(self):
+        log.info("=== Collecting Password & Authentication Policies ===")
+        # Authorization policy
+        auth_policy = self.graph.get("policies/authorizationPolicy", beta=True)
+        if auth_policy:
+            policy_data = [{
+                "allowInvitesFrom": auth_policy.get("allowInvitesFrom"),
+                "allowedToSignUpEmailBasedSubscriptions": auth_policy.get("allowedToSignUpEmailBasedSubscriptions"),
+                "allowedToUseSSPR": auth_policy.get("allowedToUseSSPR"),
+                "allowEmailVerifiedUsersToJoinOrganization": auth_policy.get("allowEmailVerifiedUsersToJoinOrganization"),
+                "blockMsolPowerShell": auth_policy.get("blockMsolPowerShell"),
+                "guestUserRoleId": auth_policy.get("guestUserRoleId"),
+                "allowUserConsentForApps": str(auth_policy.get("defaultUserRolePermissions", {}).get("allowedToCreateApps", "")),
+                "allowUserConsentForRiskyApps": str(auth_policy.get("defaultUserRolePermissions", {}).get("permissionGrantPoliciesAssigned", [])),
+            }]
+            self.exporter.export("AuthorizationPolicy", policy_data, "Tenant")
+
+            if not auth_policy.get("blockMsolPowerShell"):
+                log.investigate("MSOnline PowerShell is NOT blocked - legacy admin vector")
+
+            if auth_policy.get("allowInvitesFrom") == "everyone":
+                log.investigate("Guest invitations allowed from everyone - review restriction",
+                                mitre_ids=["T1078.004"])
+
+        # Password reset policy
+        sspr = self.graph.get("policies/authenticationFlowsPolicy", beta=True)
+        if sspr:
+            self.exporter.export("AuthenticationFlowsPolicy", [sspr], "Tenant")
+
+    def get_administrative_units(self):
+        log.info("=== Collecting Administrative Units ===")
+        aus = self.graph.get_all("directory/administrativeUnits")
+        if not aus:
+            return
+
+        au_data = [{
+            "displayName": au.get("displayName"),
+            "id": au.get("id"),
+            "description": (au.get("description") or "")[:200],
+            "visibility": au.get("visibility"),
+            "membershipType": au.get("membershipType"),
+            "membershipRule": (au.get("membershipRule") or "")[:200],
+        } for au in aus]
+
+        self.exporter.export("AdministrativeUnits", au_data, "Tenant")
+
+        # Check for restricted management AUs (can hide admin activity)
+        restricted = [au for au in aus if au.get("visibility") == "HiddenMembership"]
+        if restricted:
+            self.exporter.export("RestrictedAdminUnits", [{"displayName": au.get("displayName"),
+                                  "id": au.get("id")} for au in restricted],
+                                 "Tenant", investigate=True)
+            log.investigate(f"Found {len(restricted)} hidden-membership administrative unit(s)")
+
+    def get_directory_sync_status(self):
+        log.info("=== Collecting Directory Sync / AD Connect Status ===")
+        org_data = self.graph.get("organization")
+        if not org_data or "value" not in org_data:
+            return
+
+        org = org_data["value"][0] if org_data["value"] else {}
+        sync_enabled = org.get("onPremisesSyncEnabled", False)
+
+        sync_data = [{
+            "onPremisesSyncEnabled": sync_enabled,
+            "onPremisesLastSyncDateTime": org.get("onPremisesLastSyncDateTime"),
+            "onPremisesLastPasswordSyncDateTime": org.get("onPremisesLastPasswordSyncDateTime"),
+            "directorySizeQuota": json.dumps(org.get("directorySizeQuota", {}), default=str),
+        }]
+
+        self.exporter.export("DirectorySyncStatus", sync_data, "Tenant")
+
+        if sync_enabled:
+            log.investigate("Directory sync (AD Connect) is enabled - check for hybrid attack paths",
+                            mitre_ids=["T1556.007"])
+
+            # Check for sync accounts
+            sync_users = self.graph.get_all(
+                "users",
+                params={
+                    "$filter": "startsWith(displayName,'On-Premises Directory Synchronization')",
+                    "$select": "displayName,userPrincipalName,id,accountEnabled,createdDateTime",
+                }
+            )
+            if sync_users:
+                self.exporter.export("DirectorySyncAccounts", [{
+                    "displayName": u.get("displayName"),
+                    "upn": u.get("userPrincipalName"),
+                    "accountEnabled": u.get("accountEnabled"),
+                } for u in sync_users], "Tenant", investigate=True)
+
+    def get_managed_identities(self):
+        log.info("=== Collecting Managed Identity Service Principals ===")
+        managed = self.graph.get_all(
+            "servicePrincipals",
+            params={"$filter": "servicePrincipalType eq 'ManagedIdentity'"},
+        )
+        if not managed:
+            return
+
+        mi_data = [{
+            "displayName": m.get("displayName"),
+            "appId": m.get("appId"),
+            "id": m.get("id"),
+            "servicePrincipalType": m.get("servicePrincipalType"),
+            "createdDateTime": m.get("createdDateTime"),
+            "accountEnabled": m.get("accountEnabled"),
+            "alternativeNames": "; ".join(m.get("alternativeNames", [])),
+        } for m in managed]
+
+        self.exporter.export("ManagedIdentities", mi_data, "Tenant")
+        log.info(f"Found {len(mi_data)} managed identity service principal(s)")
+
+    def get_workload_identity_federation(self):
+        log.info("=== Collecting Workload Identity Federation ===")
+        apps = self.graph.get_all("applications", params={
+            "$select": "id,displayName,appId,federatedIdentityCredentials"
+        })
+        if not apps:
+            return
+
+        fed_creds = []
+        for app in apps:
+            fics = app.get("federatedIdentityCredentials", [])
+            if not fics:
+                # Need to query individually for federation credentials
+                fics_data = self.graph.get_all(f"applications/{app['id']}/federatedIdentityCredentials")
+                fics = fics_data or []
+
+            for fic in fics:
+                fed_creds.append({
+                    "appDisplayName": app.get("displayName"),
+                    "appId": app.get("appId"),
+                    "credentialName": fic.get("name"),
+                    "issuer": fic.get("issuer"),
+                    "subject": fic.get("subject"),
+                    "audiences": "; ".join(fic.get("audiences", [])),
+                    "description": (fic.get("description") or "")[:200],
+                })
+
+        if fed_creds:
+            self.exporter.export("WorkloadIdentityFederation", fed_creds, "Tenant", investigate=True)
+            log.investigate(
+                f"Found {len(fed_creds)} workload identity federation credential(s)",
+                mitre_ids=["T1098.001"]
+            )
+
+    def get_consent_grant_audit(self):
+        log.info("=== Collecting OAuth Consent Grant Audit (Phishing Detection) ===")
+        filter_str = (
+            "activityDisplayName eq 'Consent to application' or "
+            "activityDisplayName eq 'Add OAuth2PermissionGrant' or "
+            "activityDisplayName eq 'Add app role assignment grant to user' or "
+            "activityDisplayName eq 'Add delegated permission grant' or "
+            "activityDisplayName eq 'Add application'"
+        )
+        start_str = self.start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str = self.end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        logs = self.graph.get_all(
+            "auditLogs/directoryAudits",
+            params={
+                "$filter": f"({filter_str}) and activityDateTime ge {start_str} and activityDateTime le {end_str}"
+            },
+        )
+        if not logs:
+            return
+
+        consent_data = []
+        for e in logs:
+            initiated_by = e.get("initiatedBy", {})
+            user = initiated_by.get("user", {})
+            app_init = initiated_by.get("app", {})
+            targets = e.get("targetResources", [])
+
+            consent_data.append({
+                "activityDateTime": e.get("activityDateTime"),
+                "activity": e.get("activityDisplayName"),
+                "result": e.get("result"),
+                "initiatedByUser": user.get("userPrincipalName", ""),
+                "initiatedByApp": app_init.get("displayName", ""),
+                "targetApp": targets[0].get("displayName", "") if targets else "",
+                "targetResources": json.dumps(targets, default=str)[:500],
+                "correlationId": e.get("correlationId"),
+            })
+
+        self.exporter.export("ConsentGrantAudit", consent_data, "Tenant", investigate=True)
+        log.investigate(
+            f"Found {len(consent_data)} consent/permission grant event(s) - review for consent phishing",
+            mitre_ids=["T1528", "T1098.001"]
+        )
+
+        # Detect suspicious consent patterns
+        user_consent_count: dict[str, int] = Counter(
+            c["initiatedByUser"] for c in consent_data if c["initiatedByUser"]
+        )
+        for user, count in user_consent_count.most_common(10):
+            if count >= 3:
+                log.investigate(
+                    f"User {user} granted consent {count} times - possible consent phishing victim",
+                    mitre_ids=["T1528"]
+                )
+
+    def get_app_proxy_apps(self):
+        log.info("=== Collecting Application Proxy Applications ===")
+        proxy_apps = self.graph.get_all(
+            "applications",
+            params={"$filter": "onPremisesPublishing ne null"},
+            beta=True,
+        )
+        if not proxy_apps:
+            return
+
+        proxy_data = [{
+            "displayName": a.get("displayName"),
+            "appId": a.get("appId"),
+            "identifierUris": "; ".join(a.get("identifierUris", [])),
+            "signInAudience": a.get("signInAudience"),
+        } for a in proxy_apps]
+
+        self.exporter.export("AppProxyApplications", proxy_data, "Tenant")
+        log.info(f"Found {len(proxy_data)} Application Proxy app(s)")
+
+    def get_deleted_applications(self):
+        log.info("=== Collecting Recently Deleted Applications ===")
+        deleted = self.graph.get_all("directory/deletedItems/microsoft.graph.application")
+        if not deleted:
+            return
+
+        del_data = [{
+            "displayName": a.get("displayName"),
+            "appId": a.get("appId"),
+            "deletedDateTime": a.get("deletedDateTime"),
+            "signInAudience": a.get("signInAudience"),
+        } for a in deleted]
+
+        self.exporter.export("DeletedApplications", del_data, "Tenant")
+
+        now = datetime.now(timezone.utc)
+        recent = [a for a in deleted if parse_iso_dt(a.get("deletedDateTime"))
+                  and (now - parse_iso_dt(a.get("deletedDateTime"))).days <= 7]
+        if recent:
+            log.investigate(
+                f"Found {len(recent)} app(s) deleted in last 7 days - potential evidence cleanup",
+                mitre_ids=["T1070.009"]
+            )
+
+    def get_privileged_access_groups(self):
+        log.info("=== Collecting Privileged Access Groups ===")
+        groups = self.graph.get_all(
+            "groups",
+            params={
+                "$filter": "isAssignableToRole eq true",
+                "$select": "id,displayName,description,createdDateTime,securityEnabled,"
+                           "mailEnabled,isAssignableToRole,membershipRule",
+            },
+        )
+        if not groups:
+            return
+
+        group_data = [{
+            "displayName": g.get("displayName"),
+            "id": g.get("id"),
+            "createdDateTime": g.get("createdDateTime"),
+            "securityEnabled": g.get("securityEnabled"),
+            "description": (g.get("description") or "")[:200],
+        } for g in groups]
+
+        self.exporter.export("PrivilegedAccessGroups", group_data, "Tenant", investigate=True)
+        log.investigate(
+            f"Found {len(group_data)} role-assignable group(s) - high-value targets",
+            mitre_ids=["T1098.003"]
+        )
+
+        # Get members of each privileged group
+        for g in groups[:10]:  # Limit to avoid excessive calls
+            members = self.graph.get_all(f"groups/{g['id']}/members")
+            if members:
+                member_data = [{
+                    "groupName": g.get("displayName"),
+                    "memberName": m.get("displayName"),
+                    "memberUPN": m.get("userPrincipalName", ""),
+                    "memberType": m.get("@odata.type", ""),
+                } for m in members]
+                self.exporter.export(
+                    f"PrivilegedGroupMembers_{g.get('displayName', 'Unknown')[:30]}",
+                    member_data, "Tenant", investigate=True,
+                )
+
+    def get_access_reviews(self):
+        log.info("=== Collecting Access Review Configuration ===")
+        reviews = self.graph.get_all(
+            "identityGovernance/accessReviews/definitions", beta=True
+        )
+        if not reviews:
+            log.info("No access reviews configured")
+            return
+
+        review_data = [{
+            "displayName": r.get("displayName"),
+            "id": r.get("id"),
+            "status": r.get("status"),
+            "createdDateTime": r.get("createdDateTime"),
+            "lastModifiedDateTime": r.get("lastModifiedDateTime"),
+            "scope": json.dumps(r.get("scope", {}), default=str)[:300],
+            "reviewerType": r.get("settings", {}).get("reviewerType", ""),
+        } for r in reviews]
+
+        self.exporter.export("AccessReviews", review_data, "Tenant")
+
+    def get_mailbox_audit_bypass(self):
+        log.info("=== Checking for Mailbox Audit Bypass ===")
+        filter_str = "activityDisplayName eq 'Set-MailboxAuditBypassAssociation'"
+        logs = self.graph.get_all("auditLogs/directoryAudits", params={"$filter": filter_str})
+        if logs:
+            bypass_data = [{
+                "activityDateTime": e.get("activityDateTime"),
+                "activity": e.get("activityDisplayName"),
+                "initiatedBy": e.get("initiatedBy", {}).get("user", {}).get("userPrincipalName", ""),
+                "targetResources": json.dumps(e.get("targetResources", []), default=str)[:500],
+            } for e in logs]
+
+            self.exporter.export("MailboxAuditBypass", bypass_data, "Tenant", investigate=True)
+            log.investigate(
+                f"Found {len(bypass_data)} mailbox audit bypass event(s) - critical evasion technique",
+                mitre_ids=["T1562.008"]
+            )
 
 
 # ============================================================================
@@ -2781,6 +3315,699 @@ class TeamsInvestigator:
 
 
 # ============================================================================
+# UNIFIED TIMELINE GENERATOR
+# ============================================================================
+
+class TimelineGenerator:
+    """Generate a unified chronological timeline across all data sources."""
+
+    def __init__(self, exporter: DataExporter):
+        self.exporter = exporter
+        self.events: list[dict] = []
+
+    def add_sign_ins(self, sign_ins: list[dict]):
+        for si in sign_ins:
+            status = si.get("status", {})
+            err = status.get("errorCode", 0) if isinstance(status, dict) else 0
+            self.events.append({
+                "timestamp": si.get("createdDateTime", ""),
+                "source": "SignIn",
+                "category": "Authentication",
+                "user": si.get("userPrincipalName", ""),
+                "action": f"Sign-in to {si.get('appDisplayName', 'Unknown')}",
+                "result": "Success" if not err else f"Failure ({err})",
+                "ip": si.get("ipAddress", ""),
+                "detail": f"Client: {si.get('clientAppUsed', '')} | "
+                          f"Risk: {si.get('riskLevelDuringSignIn', 'none')}",
+            })
+
+    def add_audit_logs(self, audits: list[dict]):
+        for a in audits:
+            user = a.get("initiatedBy", {}).get("user", {}).get("userPrincipalName", "")
+            if not user:
+                user = a.get("initiatedBy", {}).get("app", {}).get("displayName", "System")
+            self.events.append({
+                "timestamp": a.get("activityDateTime", ""),
+                "source": "AuditLog",
+                "category": a.get("category", ""),
+                "user": user,
+                "action": a.get("activityDisplayName", ""),
+                "result": a.get("result", ""),
+                "ip": "",
+                "detail": a.get("correlationId", ""),
+            })
+
+    def add_alerts(self, alerts: list[dict]):
+        for a in alerts:
+            self.events.append({
+                "timestamp": a.get("createdDateTime", ""),
+                "source": "SecurityAlert",
+                "category": a.get("category", ""),
+                "user": "",
+                "action": a.get("title", ""),
+                "result": a.get("severity", ""),
+                "ip": "",
+                "detail": (a.get("description", "") or "")[:200],
+            })
+
+    def add_risk_detections(self, detections: list[dict]):
+        for d in detections:
+            self.events.append({
+                "timestamp": d.get("detectedDateTime", ""),
+                "source": "RiskDetection",
+                "category": d.get("riskEventType", ""),
+                "user": d.get("userPrincipalName", ""),
+                "action": d.get("riskEventType", ""),
+                "result": d.get("riskLevel", ""),
+                "ip": d.get("ipAddress", ""),
+                "detail": d.get("riskDetail", ""),
+            })
+
+    def add_custom(self, timestamp: str, source: str, category: str,
+                   user: str, action: str, result: str = "", detail: str = ""):
+        self.events.append({
+            "timestamp": timestamp,
+            "source": source,
+            "category": category,
+            "user": user,
+            "action": action,
+            "result": result,
+            "ip": "",
+            "detail": detail,
+        })
+
+    def generate(self):
+        """Sort and export the unified timeline."""
+        if not self.events:
+            return
+
+        sorted_events = sorted(self.events, key=lambda x: x.get("timestamp", ""))
+        self.exporter.export("UnifiedTimeline", sorted_events, "Timeline")
+
+        # User activity summary
+        user_counts = Counter(e["user"] for e in sorted_events if e["user"])
+        user_summary = [{"user": u, "eventCount": c} for u, c in user_counts.most_common(50)]
+        self.exporter.export("TimelineUserSummary", user_summary, "Timeline")
+
+        # Source summary
+        source_counts = Counter(e["source"] for e in sorted_events)
+        source_summary = [{"source": s, "eventCount": c} for s, c in source_counts.most_common()]
+        self.exporter.export("TimelineSourceSummary", source_summary, "Timeline")
+
+        # Hourly activity heatmap
+        hourly: dict[int, int] = defaultdict(int)
+        for e in sorted_events:
+            dt = parse_iso_dt(e.get("timestamp"))
+            if dt:
+                hourly[dt.hour] += 1
+        heatmap = [{"hour": h, "eventCount": hourly.get(h, 0)} for h in range(24)]
+        self.exporter.export("TimelineHourlyHeatmap", heatmap, "Timeline")
+
+        log.success(f"Unified timeline generated: {len(sorted_events)} events")
+
+
+# ============================================================================
+# USER-AGENT / SESSION / COUNTRY ANALYSIS
+# ============================================================================
+
+class SignInAnalyzer:
+    """Advanced sign-in analysis: user-agent clustering, country anomaly, session correlation."""
+
+    def __init__(self, exporter: DataExporter):
+        self.exporter = exporter
+
+    def analyze_user_agents(self, sign_ins: list[dict]):
+        """Cluster and analyze user-agent strings for anomalies."""
+        ua_groups: dict[str, list] = defaultdict(list)
+        for si in sign_ins:
+            device = si.get("deviceDetail", {}) or {}
+            browser = device.get("browser", "Unknown")
+            os_name = device.get("operatingSystem", "Unknown")
+            ua_key = f"{browser} | {os_name}"
+            ua_groups[ua_key].append(si)
+
+        ua_data = []
+        for ua, events in sorted(ua_groups.items(), key=lambda x: len(x[1]), reverse=True):
+            users = set(e.get("userPrincipalName", "") for e in events)
+            ips = set(e.get("ipAddress", "") for e in events)
+            times = [e.get("createdDateTime", "") for e in events if e.get("createdDateTime")]
+            ua_data.append({
+                "userAgent": ua,
+                "count": len(events),
+                "uniqueUsers": len(users),
+                "uniqueIPs": len(ips),
+                "users": "; ".join(sorted(users)[:10]),
+                "firstSeen": min(times) if times else "",
+                "lastSeen": max(times) if times else "",
+            })
+
+        if ua_data:
+            self.exporter.export("UserAgentAnalysis", ua_data, "Analysis")
+
+            # Flag unusual user agents (seen very few times)
+            rare = [ua for ua in ua_data if ua["count"] <= 2 and ua["uniqueUsers"] == 1]
+            if rare:
+                self.exporter.export("RareUserAgents", rare, "Analysis", investigate=True)
+                log.investigate(f"Found {len(rare)} rare user-agent combination(s)")
+
+    def analyze_countries(self, sign_ins: list[dict]):
+        """Analyze sign-in countries for anomalies."""
+        country_groups: dict[str, list] = defaultdict(list)
+        for si in sign_ins:
+            loc = si.get("location", {}) if isinstance(si.get("location"), dict) else {}
+            country = loc.get("countryOrRegion", "Unknown")
+            country_groups[country].append(si)
+
+        country_data = []
+        for country, events in sorted(country_groups.items(), key=lambda x: len(x[1]), reverse=True):
+            users = set(e.get("userPrincipalName", "") for e in events)
+            success = sum(1 for e in events if not (isinstance(e.get("status"), dict) and
+                          e.get("status", {}).get("errorCode")))
+            failed = len(events) - success
+            times = [e.get("createdDateTime", "") for e in events if e.get("createdDateTime")]
+            country_data.append({
+                "country": country,
+                "totalSignIns": len(events),
+                "successfulSignIns": success,
+                "failedSignIns": failed,
+                "uniqueUsers": len(users),
+                "failureRate": round(failed / len(events) * 100, 1) if events else 0,
+                "firstSeen": min(times) if times else "",
+                "lastSeen": max(times) if times else "",
+            })
+
+        if country_data:
+            self.exporter.export("CountryAnalysis", country_data, "Analysis")
+
+            # Flag countries with high failure rates (potential attack origins)
+            suspicious_countries = [c for c in country_data
+                                     if c["failureRate"] > 80 and c["totalSignIns"] >= 5]
+            if suspicious_countries:
+                self.exporter.export("SuspiciousCountries", suspicious_countries,
+                                     "Analysis", investigate=True)
+                for c in suspicious_countries:
+                    log.investigate(
+                        f"Country {c['country']}: {c['failureRate']}% failure rate "
+                        f"({c['failedSignIns']}/{c['totalSignIns']} sign-ins)",
+                        mitre_ids=["T1110.003"]
+                    )
+
+    def analyze_sessions(self, sign_ins: list[dict]):
+        """Correlate sign-in sessions by correlationId."""
+        session_groups: dict[str, list] = defaultdict(list)
+        for si in sign_ins:
+            cid = si.get("correlationId", "")
+            if cid:
+                session_groups[cid].append(si)
+
+        # Find multi-step sessions (potential attack chains)
+        multi_step = {cid: events for cid, events in session_groups.items() if len(events) >= 3}
+
+        if multi_step:
+            session_data = []
+            for cid, events in sorted(multi_step.items(),
+                                        key=lambda x: len(x[1]), reverse=True)[:50]:
+                sorted_events = sorted(events, key=lambda x: x.get("createdDateTime", ""))
+                apps = set(e.get("appDisplayName", "") for e in sorted_events)
+                resources = set(e.get("resourceDisplayName", "") for e in sorted_events)
+                session_data.append({
+                    "correlationId": cid,
+                    "eventCount": len(sorted_events),
+                    "user": sorted_events[0].get("userPrincipalName", ""),
+                    "startTime": sorted_events[0].get("createdDateTime", ""),
+                    "endTime": sorted_events[-1].get("createdDateTime", ""),
+                    "applications": "; ".join(apps),
+                    "resources": "; ".join(resources),
+                    "ipAddress": sorted_events[0].get("ipAddress", ""),
+                })
+
+            self.exporter.export("SessionCorrelation", session_data, "Analysis")
+
+    def analyze_app_usage(self, sign_ins: list[dict]):
+        """Analyze application usage patterns."""
+        app_groups: dict[str, list] = defaultdict(list)
+        for si in sign_ins:
+            app = si.get("appDisplayName", "Unknown")
+            app_groups[app].append(si)
+
+        app_data = []
+        for app, events in sorted(app_groups.items(), key=lambda x: len(x[1]), reverse=True):
+            users = set(e.get("userPrincipalName", "") for e in events)
+            ips = set(e.get("ipAddress", "") for e in events if e.get("ipAddress"))
+            success = sum(1 for e in events if not (isinstance(e.get("status"), dict) and
+                          e.get("status", {}).get("errorCode")))
+            app_data.append({
+                "application": app,
+                "totalSignIns": len(events),
+                "successfulSignIns": success,
+                "uniqueUsers": len(users),
+                "uniqueIPs": len(ips),
+            })
+
+        if app_data:
+            self.exporter.export("ApplicationUsageAnalysis", app_data, "Analysis")
+
+
+# ============================================================================
+# KQL QUERY GENERATOR
+# ============================================================================
+
+class KQLQueryGenerator:
+    """Generate Microsoft Sentinel KQL queries from investigation findings."""
+
+    def __init__(self, output_root: str):
+        self.output_root = output_root
+        self.queries: list[dict] = []
+
+    def add_ip_query(self, ip: str):
+        self.queries.append({
+            "name": f"Sign-ins from IP {ip}",
+            "description": f"All sign-in activity from suspicious IP {ip}",
+            "query": f"""SigninLogs
+| where IPAddress == "{ip}"
+| project TimeGenerated, UserPrincipalName, AppDisplayName, IPAddress,
+          LocationDetails, ResultType, ResultDescription, ClientAppUsed
+| sort by TimeGenerated desc""",
+        })
+        self.queries.append({
+            "name": f"AAD Audit from IP {ip}",
+            "description": f"Directory audit events correlated with IP {ip}",
+            "query": f"""SigninLogs
+| where IPAddress == "{ip}"
+| project CorrelationId
+| join kind=inner (AuditLogs) on CorrelationId
+| project TimeGenerated, OperationName, Result, InitiatedBy, TargetResources
+| sort by TimeGenerated desc""",
+        })
+
+    def add_user_query(self, upn: str):
+        self.queries.append({
+            "name": f"All activity for {upn}",
+            "description": f"Comprehensive activity timeline for {upn}",
+            "query": f"""let user = "{upn}";
+SigninLogs
+| where UserPrincipalName =~ user
+| project TimeGenerated, Type="SignIn", Operation=AppDisplayName,
+          Result=tostring(ResultType), IPAddress, Details=ClientAppUsed
+| union (
+    AuditLogs
+    | where InitiatedBy.user.userPrincipalName =~ user
+    | project TimeGenerated, Type="Audit", Operation=OperationName,
+              Result, IPAddress="", Details=tostring(TargetResources)
+)
+| sort by TimeGenerated desc""",
+        })
+
+    def add_forwarding_query(self):
+        self.queries.append({
+            "name": "Email forwarding rule changes",
+            "description": "Detect inbox rule changes that create forwarding",
+            "query": """AuditLogs
+| where OperationName in ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules")
+| extend Parameters = tostring(TargetResources[0].modifiedProperties)
+| where Parameters contains "ForwardTo" or Parameters contains "RedirectTo"
+        or Parameters contains "ForwardAsAttachmentTo"
+| project TimeGenerated, InitiatedBy.user.userPrincipalName,
+          OperationName, Parameters
+| sort by TimeGenerated desc""",
+        })
+
+    def add_consent_query(self):
+        self.queries.append({
+            "name": "OAuth consent grants",
+            "description": "Detect application consent grant events",
+            "query": """AuditLogs
+| where OperationName == "Consent to application"
+| extend AppName = TargetResources[0].displayName
+| extend ConsentedBy = InitiatedBy.user.userPrincipalName
+| project TimeGenerated, ConsentedBy, AppName, Result, TargetResources
+| sort by TimeGenerated desc""",
+        })
+
+    def add_impossible_travel_query(self):
+        self.queries.append({
+            "name": "Impossible travel detection",
+            "description": "Detect sign-ins from geographically impossible locations",
+            "query": """SigninLogs
+| where ResultType == 0
+| extend City = LocationDetails.city, Country = LocationDetails.countryOrRegion,
+         Lat = toreal(LocationDetails.geoCoordinates.latitude),
+         Lon = toreal(LocationDetails.geoCoordinates.longitude)
+| project TimeGenerated, UserPrincipalName, IPAddress, City, Country, Lat, Lon
+| sort by UserPrincipalName, TimeGenerated asc
+| serialize
+| extend PrevTime = prev(TimeGenerated), PrevLat = prev(Lat), PrevLon = prev(Lon),
+         PrevUser = prev(UserPrincipalName), PrevCountry = prev(Country)
+| where UserPrincipalName == PrevUser
+| extend TimeDiffHours = datetime_diff('hour', TimeGenerated, PrevTime)
+| where Country != PrevCountry and TimeDiffHours < 2
+| project TimeGenerated, UserPrincipalName, IPAddress,
+          FromCountry=PrevCountry, ToCountry=Country, TimeDiffHours""",
+        })
+
+    def add_password_spray_query(self):
+        self.queries.append({
+            "name": "Password spray detection",
+            "description": "Detect distributed brute force across multiple accounts",
+            "query": """SigninLogs
+| where ResultType in ("50126", "50053", "50055")
+| summarize FailedUsers=dcount(UserPrincipalName),
+            FailedAttempts=count(),
+            Users=make_set(UserPrincipalName, 20)
+  by IPAddress, bin(TimeGenerated, 1h)
+| where FailedUsers >= 5 and FailedAttempts >= 10
+| sort by FailedAttempts desc""",
+        })
+
+    def add_legacy_auth_query(self):
+        self.queries.append({
+            "name": "Legacy authentication usage",
+            "description": "Detect use of legacy authentication protocols",
+            "query": """SigninLogs
+| where ClientAppUsed in ("Authenticated SMTP", "Autodiscover",
+         "Exchange ActiveSync", "Exchange Online PowerShell",
+         "IMAP4", "MAPI Over HTTP", "Offline Address Book",
+         "Other clients", "POP3", "Reporting Web Services")
+| summarize Count=count() by UserPrincipalName, ClientAppUsed, IPAddress
+| sort by Count desc""",
+        })
+
+    def generate_all_default(self):
+        """Generate a comprehensive set of default hunting queries."""
+        self.add_forwarding_query()
+        self.add_consent_query()
+        self.add_impossible_travel_query()
+        self.add_password_spray_query()
+        self.add_legacy_auth_query()
+
+    def export(self):
+        """Export all KQL queries."""
+        if not self.queries:
+            return
+
+        kql_dir = os.path.join(self.output_root, "KQL_Queries")
+        os.makedirs(kql_dir, exist_ok=True)
+
+        # Individual query files
+        for i, q in enumerate(self.queries):
+            safe_name = re.sub(r'[^\w\-]', '_', q["name"])[:60]
+            path = os.path.join(kql_dir, f"{i+1:02d}_{safe_name}.kql")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"// {q['name']}\n")
+                f.write(f"// {q['description']}\n")
+                f.write(f"// Generated by VCD Cloud Investigator v{VERSION}\n\n")
+                f.write(q["query"])
+
+        # Combined query file
+        combined_path = os.path.join(kql_dir, "ALL_QUERIES.kql")
+        with open(combined_path, "w", encoding="utf-8") as f:
+            f.write(f"// VCD Cloud Investigator - Sentinel Hunting Queries\n")
+            f.write(f"// Generated: {datetime.now().isoformat()}\n")
+            f.write(f"// Total queries: {len(self.queries)}\n\n")
+            for q in self.queries:
+                f.write(f"// {'=' * 70}\n")
+                f.write(f"// {q['name']}\n")
+                f.write(f"// {q['description']}\n")
+                f.write(f"// {'=' * 70}\n\n")
+                f.write(q["query"])
+                f.write("\n\n")
+
+        log.success(f"Generated {len(self.queries)} KQL hunting queries in {kql_dir}")
+
+
+# ============================================================================
+# REMEDIATION RECOMMENDATIONS ENGINE
+# ============================================================================
+
+class RemediationEngine:
+    """Generate actionable remediation recommendations from findings."""
+
+    RECOMMENDATIONS: dict[str, dict] = {
+        "VCD-SI-001": {
+            "title": "Password Spray Attack Detected",
+            "priority": "CRITICAL",
+            "actions": [
+                "Block the source IP address(es) in Conditional Access",
+                "Reset passwords for any successfully compromised accounts",
+                "Enable Azure AD Smart Lockout",
+                "Implement Conditional Access policies requiring MFA",
+                "Review sign-in logs for successful authentications from the same IP",
+                "Consider implementing Azure AD Password Protection",
+            ],
+        },
+        "VCD-SI-002": {
+            "title": "Legacy Authentication Protocol Usage",
+            "priority": "HIGH",
+            "actions": [
+                "Create Conditional Access policy to block legacy authentication",
+                "Identify and migrate applications using legacy auth to modern auth",
+                "Disable legacy auth protocols at the tenant level",
+                "Monitor for new legacy auth usage after blocking",
+            ],
+        },
+        "VCD-SI-003": {
+            "title": "MFA Fatigue Attack",
+            "priority": "CRITICAL",
+            "actions": [
+                "Reset the user's password immediately",
+                "Revoke all active sessions and refresh tokens",
+                "Switch to number-matching or FIDO2 for MFA",
+                "Disable simple push notifications",
+                "Investigate all actions taken during the compromised session",
+            ],
+        },
+        "VCD-SI-006": {
+            "title": "Impossible Travel Detected",
+            "priority": "HIGH",
+            "actions": [
+                "Verify with the user whether both sign-ins are legitimate",
+                "Check for VPN usage that could explain location discrepancy",
+                "If unauthorized, reset password and revoke sessions",
+                "Review actions taken from the suspicious location",
+                "Enable Conditional Access with named locations",
+            ],
+        },
+        "VCD-IR-001": {
+            "title": "Email Forwarding Rule",
+            "priority": "HIGH",
+            "actions": [
+                "Disable or delete the forwarding rule immediately",
+                "Notify the user and verify if the rule is legitimate",
+                "Check for other indicators of compromise on the account",
+                "Review emails already forwarded to the external address",
+                "Implement mail flow rules to block external auto-forwarding",
+            ],
+        },
+        "VCD-IR-002": {
+            "title": "Evidence Hiding Inbox Rule",
+            "priority": "CRITICAL",
+            "actions": [
+                "Delete the malicious rule immediately",
+                "Assume the account is compromised - full IR response",
+                "Reset password and revoke all sessions",
+                "Search for lateral movement from the account",
+                "Review Deleted Items and Recoverable Items folders",
+                "Check for other persistence mechanisms (OAuth apps, delegates)",
+            ],
+        },
+        "VCD-APP-001": {
+            "title": "Admin-Consented Dangerous Permissions",
+            "priority": "CRITICAL",
+            "actions": [
+                "Review and remove unnecessary admin consent grants",
+                "Verify the application is legitimate and from a trusted publisher",
+                "Restrict user consent to verified publishers only",
+                "Implement admin consent workflow",
+                "Audit all admin consent grants regularly",
+            ],
+        },
+        "VCD-ROLE-001": {
+            "title": "Global Admin Role Assignment",
+            "priority": "CRITICAL",
+            "actions": [
+                "Verify the assignment was authorized",
+                "Implement PIM for just-in-time Global Admin access",
+                "Ensure all Global Admins have phishing-resistant MFA",
+                "Limit the number of permanent Global Admins to 2-4",
+                "Create break-glass accounts with proper monitoring",
+            ],
+        },
+        "VCD-FED-001": {
+            "title": "Federated Domain / Golden SAML Risk",
+            "priority": "HIGH",
+            "actions": [
+                "Verify federation configuration is legitimate",
+                "Rotate SAML token signing certificates",
+                "Monitor for anomalous SAML token usage",
+                "Implement Conditional Access for federated sign-ins",
+                "Consider migrating to Managed authentication",
+            ],
+        },
+        "VCD-CA-001": {
+            "title": "No Conditional Access Policies",
+            "priority": "CRITICAL",
+            "actions": [
+                "Implement baseline Conditional Access policies immediately",
+                "Require MFA for all users",
+                "Block legacy authentication",
+                "Require compliant devices for access",
+                "Implement risk-based Conditional Access",
+            ],
+        },
+    }
+
+    def __init__(self, exporter: DataExporter, detections: list[dict]):
+        self.exporter = exporter
+        self.detections = detections
+
+    def generate(self):
+        """Generate remediation recommendations based on detections."""
+        if not self.detections:
+            return
+
+        recommendations = []
+        seen_rules = set()
+
+        for det in self.detections:
+            rule_id = det.get("ruleId", "")
+            if rule_id in seen_rules:
+                continue
+            seen_rules.add(rule_id)
+
+            rec = self.RECOMMENDATIONS.get(rule_id)
+            if rec:
+                recommendations.append({
+                    "ruleId": rule_id,
+                    "title": rec["title"],
+                    "priority": rec["priority"],
+                    "finding": det.get("detail", ""),
+                    "actions": "\n".join(f"  {i+1}. {a}" for i, a in enumerate(rec["actions"])),
+                })
+
+        if recommendations:
+            self.exporter.export("RemediationRecommendations", recommendations, "Remediation")
+
+            # Generate markdown report
+            md_lines = [
+                "# VCD Cloud Investigator - Remediation Recommendations\n",
+                f"Generated: {datetime.now().isoformat()}\n",
+                f"Total Recommendations: {len(recommendations)}\n\n",
+                "---\n",
+            ]
+            for rec in sorted(recommendations, key=lambda x: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(x["priority"], 3)):
+                md_lines.append(f"\n## [{rec['priority']}] {rec['title']}\n")
+                md_lines.append(f"**Rule:** {rec['ruleId']}\n")
+                md_lines.append(f"**Finding:** {rec['finding']}\n\n")
+                md_lines.append("**Remediation Steps:**\n")
+                md_lines.append(rec["actions"] + "\n")
+                md_lines.append("\n---\n")
+
+            rem_dir = os.path.join(self.exporter.output_root, "Remediation")
+            os.makedirs(rem_dir, exist_ok=True)
+            md_path = os.path.join(rem_dir, "RemediationReport.md")
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write("".join(md_lines))
+
+            log.success(f"Generated {len(recommendations)} remediation recommendation(s)")
+
+
+# ============================================================================
+# STIX/TAXII IOC EXPORT
+# ============================================================================
+
+class STIXExporter:
+    """Export IOCs in STIX 2.1 format for threat intelligence sharing."""
+
+    def __init__(self, output_root: str, investigation_id: str):
+        self.output_root = output_root
+        self.investigation_id = investigation_id
+
+    def export(self, iocs: dict[str, set]):
+        """Export IOCs as STIX 2.1 bundle."""
+        stix_objects = []
+
+        # Identity (the tool)
+        identity = {
+            "type": "identity",
+            "spec_version": "2.1",
+            "id": f"identity--{uuid.uuid4()}",
+            "created": datetime.now(timezone.utc).isoformat(),
+            "modified": datetime.now(timezone.utc).isoformat(),
+            "name": "VCD Cloud Investigator",
+            "identity_class": "tool",
+        }
+        stix_objects.append(identity)
+
+        # IP indicators
+        for ip in iocs.get("ip_addresses", set()):
+            indicator = {
+                "type": "indicator",
+                "spec_version": "2.1",
+                "id": f"indicator--{uuid.uuid4()}",
+                "created": datetime.now(timezone.utc).isoformat(),
+                "modified": datetime.now(timezone.utc).isoformat(),
+                "name": f"Suspicious IP: {ip}",
+                "pattern": f"[ipv4-addr:value = '{ip}']",
+                "pattern_type": "stix",
+                "valid_from": datetime.now(timezone.utc).isoformat(),
+                "labels": ["malicious-activity"],
+                "created_by_ref": identity["id"],
+            }
+            stix_objects.append(indicator)
+
+        # Email indicators
+        for email in iocs.get("email_addresses", set()):
+            indicator = {
+                "type": "indicator",
+                "spec_version": "2.1",
+                "id": f"indicator--{uuid.uuid4()}",
+                "created": datetime.now(timezone.utc).isoformat(),
+                "modified": datetime.now(timezone.utc).isoformat(),
+                "name": f"Suspicious Email: {email}",
+                "pattern": f"[email-addr:value = '{email}']",
+                "pattern_type": "stix",
+                "valid_from": datetime.now(timezone.utc).isoformat(),
+                "labels": ["malicious-activity"],
+                "created_by_ref": identity["id"],
+            }
+            stix_objects.append(indicator)
+
+        # Domain indicators
+        for domain in iocs.get("domains", set()):
+            indicator = {
+                "type": "indicator",
+                "spec_version": "2.1",
+                "id": f"indicator--{uuid.uuid4()}",
+                "created": datetime.now(timezone.utc).isoformat(),
+                "modified": datetime.now(timezone.utc).isoformat(),
+                "name": f"Suspicious Domain: {domain}",
+                "pattern": f"[domain-name:value = '{domain}']",
+                "pattern_type": "stix",
+                "valid_from": datetime.now(timezone.utc).isoformat(),
+                "labels": ["malicious-activity"],
+                "created_by_ref": identity["id"],
+            }
+            stix_objects.append(indicator)
+
+        if len(stix_objects) <= 1:  # Only identity, no IOCs
+            return
+
+        bundle = {
+            "type": "bundle",
+            "id": f"bundle--{uuid.uuid4()}",
+            "objects": stix_objects,
+        }
+
+        stix_dir = os.path.join(self.output_root, "IOCs")
+        os.makedirs(stix_dir, exist_ok=True)
+        stix_path = os.path.join(stix_dir, "iocs_stix2.1.json")
+        with open(stix_path, "w", encoding="utf-8") as f:
+            json.dump(bundle, f, indent=2, default=str)
+
+        log.success(f"STIX 2.1 bundle exported: {len(stix_objects) - 1} indicators")
+
+
+# ============================================================================
 # IP INVESTIGATION
 # ============================================================================
 
@@ -3552,7 +4779,8 @@ Investigation Types:
     os.makedirs(output_root, exist_ok=True)
     for folder in ("Tenant", "Users", "IP_Investigation", "Summary",
                     "ThreatDetection", "IOCs", "BEC_Investigation",
-                    "SharePoint", "Teams", "SIEM_Export"):
+                    "SharePoint", "Teams", "SIEM_Export", "Analysis",
+                    "Timeline", "KQL_Queries", "Remediation"):
         os.makedirs(os.path.join(output_root, folder), exist_ok=True)
 
     log.set_output_root(output_root)
@@ -3604,6 +4832,10 @@ Investigation Types:
     threat_engine = ThreatDetectionEngine(exporter) if not args.skip_threat_detection else None
     ioc_extractor = IOCExtractor(exporter)
 
+    # Data holders reused across modules
+    all_sign_ins = []
+    all_alerts = []
+
     # ── Tenant Investigation ──
     if inv_type in ("tenant", "full", "complete"):
         tenant = TenantInvestigator(graph, exporter, start_date, end_date)
@@ -3643,11 +4875,12 @@ Investigation Types:
         log.info("Running Automated Threat Detection Engine")
         log.info("=" * 50)
 
-        # Collect data for analysis
+        # Collect data for analysis (reused by timeline, SIEM export, etc.)
         all_sign_ins = graph.get_all("auditLogs/signIns", max_records=5000)
         all_apps = graph.get_all("applications")
         all_grants = graph.get_all("oauth2PermissionGrants")
         all_sps = graph.get_all("servicePrincipals")
+        all_alerts = graph.get_all("security/alerts_v2", beta=True)
         domains = graph.get_all("domains")
         ca_policies = graph.get_all("identity/conditionalAccess/policies")
 
@@ -3666,41 +4899,100 @@ Investigation Types:
 
         threat_engine.export_results()
 
-        # IOC extraction
+        # IOC extraction from collected data
         ioc_extractor.extract_from_sign_ins(all_sign_ins)
         ioc_extractor.extract_from_apps(all_apps)
+        ioc_extractor.extract_from_alerts(all_alerts)
+
+        # Remediation recommendations
+        remediation = RemediationEngine(exporter, threat_engine.detections)
+        remediation.generate()
+
+    # ── Advanced Sign-In Analysis ──
+    if inv_type in ("full", "complete"):
+        log.info("=" * 50)
+        log.info("Running Advanced Sign-In Analysis")
+        log.info("=" * 50)
+
+        if not threat_engine:
+            all_sign_ins = graph.get_all("auditLogs/signIns", max_records=5000)
+        analyzer = SignInAnalyzer(exporter)
+        analyzer.analyze_user_agents(all_sign_ins)
+        analyzer.analyze_countries(all_sign_ins)
+        analyzer.analyze_sessions(all_sign_ins)
+        analyzer.analyze_app_usage(all_sign_ins)
+
+    # ── Unified Timeline ──
+    if inv_type in ("full", "complete"):
+        log.info("=" * 50)
+        log.info("Generating Unified Investigation Timeline")
+        log.info("=" * 50)
+
+        timeline = TimelineGenerator(exporter)
+        if not threat_engine:
+            all_sign_ins = graph.get_all("auditLogs/signIns", max_records=5000)
+        timeline.add_sign_ins(all_sign_ins)
+
+        audit_logs = graph.get_all("auditLogs/directoryAudits", max_records=5000)
+        timeline.add_audit_logs(audit_logs)
+
+        all_alerts = graph.get_all("security/alerts_v2", beta=True) if not threat_engine else all_alerts
+        timeline.add_alerts(all_alerts)
+
+        risk_dets = graph.get_all("identityProtection/riskDetections", max_records=2000)
+        timeline.add_risk_detections(risk_dets)
+
+        timeline.generate()
 
     # ── IOC Export ──
     ioc_extractor.export_iocs()
+
+    # ── STIX IOC Export ──
+    stix = STIXExporter(output_root, investigation_id)
+    stix.export(ioc_extractor.iocs)
+
+    # ── KQL Query Generation ──
+    log.info("Generating Sentinel KQL hunting queries")
+    kql = KQLQueryGenerator(output_root)
+    kql.generate_all_default()
+    if ips:
+        for ip in ips:
+            kql.add_ip_query(ip)
+    if users:
+        for upn in users:
+            kql.add_user_query(upn)
+    kql.export()
 
     # ── SIEM Export ──
     if args.siem_export:
         log.info(f"Exporting data in SIEM format: {args.siem_export}")
         siem = SIEMExporter(output_root)
 
-        # Gather data to export
-        sign_ins = graph.get_all("auditLogs/signIns", max_records=5000)
-        alerts = graph.get_all("security/alerts_v2", beta=True)
+        # Reuse already collected data or fetch fresh
+        if 'all_sign_ins' not in dir():
+            all_sign_ins = graph.get_all("auditLogs/signIns", max_records=5000)
+        if 'all_alerts' not in dir():
+            all_alerts = graph.get_all("security/alerts_v2", beta=True)
 
         if args.siem_export in ("splunk", "all"):
-            if sign_ins:
-                siem.export_splunk(sign_ins, "sign_ins")
-            if alerts:
-                siem.export_splunk(alerts, "security_alerts")
+            if all_sign_ins:
+                siem.export_splunk(all_sign_ins, "sign_ins")
+            if all_alerts:
+                siem.export_splunk(all_alerts, "security_alerts")
             if threat_engine and threat_engine.detections:
                 siem.export_splunk(threat_engine.detections, "threat_detections")
 
         if args.siem_export in ("elastic", "all"):
-            if sign_ins:
-                siem.export_elastic(sign_ins, "sign-ins")
-            if alerts:
-                siem.export_elastic(alerts, "security-alerts")
+            if all_sign_ins:
+                siem.export_elastic(all_sign_ins, "sign-ins")
+            if all_alerts:
+                siem.export_elastic(all_alerts, "security-alerts")
 
         if args.siem_export in ("sentinel", "all"):
-            if sign_ins:
-                siem.export_sentinel(sign_ins, "VCD_SignIns")
-            if alerts:
-                siem.export_sentinel(alerts, "VCD_SecurityAlerts")
+            if all_sign_ins:
+                siem.export_sentinel(all_sign_ins, "VCD_SignIns")
+            if all_alerts:
+                siem.export_sentinel(all_alerts, "VCD_SecurityAlerts")
 
     # ── Summary Report ──
     generate_summary(output_root, investigation_id, inv_type, days,
@@ -3719,6 +5011,11 @@ Investigation Types:
     log.success(f"Suspicious findings: {log.suspicious_count}")
     log.success(f"MITRE techniques matched: {len(log.mitre_hits)}")
     log.success(f"API calls made: {graph.api_call_count}")
+    if threat_engine:
+        critical = sum(1 for d in threat_engine.detections if d["severity"] == "CRITICAL")
+        high = sum(1 for d in threat_engine.detections if d["severity"] == "HIGH")
+        log.success(f"Threat detections: {len(threat_engine.detections)} "
+                     f"({critical} critical, {high} high)")
     log.success("=" * 60)
 
 

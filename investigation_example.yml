@@ -1,0 +1,32 @@
+# VCD Cloud Investigator - Sample Configuration File
+# Copy this file and customize for your investigation
+#
+# Usage: python vcd_cloud_investigator.py --config investigation.yml
+
+# Investigation type: tenant | user | ip | full | bec | complete
+type: complete
+
+# Users to investigate (comma-separated UPNs)
+users:
+  - user@contoso.com
+  - admin@contoso.com
+
+# IPs to investigate (for IP investigation type)
+# ips:
+#   - 203.0.113.50
+#   - 198.51.100.25
+
+# Lookback period in days (1-365)
+days: 90
+
+# Output directory (optional - auto-generated if not specified)
+# output: /path/to/output
+
+# Azure AD Authentication
+# Set these OR use environment variables (VCD_TENANT_ID, VCD_CLIENT_ID, VCD_CLIENT_SECRET)
+# auth:
+#   tenant_id: "your-tenant-id"
+#   client_id: "your-app-client-id"
+#   client_secret: "your-client-secret"  # Omit for interactive/device code auth
+#   certificate_path: "/path/to/cert.pem"  # For cert-based auth
+#   certificate_password: ""  # Optional cert password
