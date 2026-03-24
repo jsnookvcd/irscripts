@@ -103,6 +103,7 @@ import json
 import logging
 import math
 import os
+import pickle
 import re
 import sys
 import threading
@@ -133,13 +134,26 @@ except ImportError:
 # CONSTANTS
 # ============================================================================
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_BETA = "https://graph.microsoft.com/beta"
 ARM_BASE = "https://management.azure.com"
 
 GRAPH_SCOPES = ["https://graph.microsoft.com/.default"]
 ARM_SCOPES = ["https://management.azure.com/.default"]
+
+# Exchange Online REST endpoints (for message trace)
+EXO_REPORTING_BASE = "https://reports.office365.com/ecp/reportingwebservice/reporting.svc"
+
+# ARM API versions for key resource types
+ARM_API_VERSIONS = {
+    "activityLog": "2015-04-01",
+    "keyVault": "2023-07-01",
+    "storage": "2023-05-01",
+    "network": "2023-11-01",
+    "compute": "2024-03-01",
+    "diagnosticSettings": "2021-05-01-preview",
+}
 
 # Permissions required (application permissions for the app registration):
 # AuditLog.Read.All, Directory.Read.All, User.Read.All, Application.Read.All,
@@ -431,6 +445,44 @@ class DataExporter:
 # GRAPH API CLIENT
 # ============================================================================
 
+class InvestigationCheckpoint:
+    """Checkpoint/resume support for long-running investigations."""
+
+    def __init__(self, output_root: str):
+        self.checkpoint_path = os.path.join(output_root, ".checkpoint.pkl")
+        self.completed_steps: set[str] = set()
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.checkpoint_path):
+            try:
+                with open(self.checkpoint_path, "rb") as f:
+                    data = pickle.load(f)
+                self.completed_steps = data.get("completed_steps", set())
+                log.info(f"Resumed from checkpoint: {len(self.completed_steps)} steps already completed")
+            except Exception:
+                self.completed_steps = set()
+
+    def save(self):
+        try:
+            with open(self.checkpoint_path, "wb") as f:
+                pickle.dump({"completed_steps": self.completed_steps}, f)
+        except Exception:
+            pass
+
+    def is_done(self, step_name: str) -> bool:
+        return step_name in self.completed_steps
+
+    def mark_done(self, step_name: str):
+        self.completed_steps.add(step_name)
+        self.save()
+
+    def clear(self):
+        self.completed_steps.clear()
+        if os.path.exists(self.checkpoint_path):
+            os.remove(self.checkpoint_path)
+
+
 class GraphClient:
     """Microsoft Graph API client with MSAL auth, retry logic, rate limiting, and concurrency."""
 
@@ -446,11 +498,14 @@ class GraphClient:
         self.client_id = client_id
         self.token = None
         self.token_expiry = None
+        self.arm_token = None
+        self.arm_token_expiry = None
         self.max_workers = max_workers
         self._token_lock = threading.Lock()
         self._rate_limit_remaining = 10000
         self._rate_limit_lock = threading.Lock()
         self.api_call_count = 0
+        self.errors: list[dict] = []  # Structured error log
 
         authority = f"https://login.microsoftonline.com/{tenant_id}"
 
@@ -495,10 +550,10 @@ class GraphClient:
         except Exception:
             return ""
 
-    def authenticate(self) -> bool:
-        """Acquire an access token."""
+    def authenticate(self, scopes: list[str] | None = None) -> bool:
+        """Acquire an access token for Graph API (and optionally ARM)."""
         try:
-            delegated_scopes = [
+            delegated_scopes = scopes or [
                 "AuditLog.Read.All", "Directory.Read.All", "User.Read.All",
                 "Application.Read.All", "Policy.Read.All",
                 "RoleManagement.Read.All", "Reports.Read.All",
@@ -531,11 +586,48 @@ class GraphClient:
             log.error(f"Authentication failed: {e}")
             return False
 
+    def authenticate_arm(self) -> bool:
+        """Acquire a separate access token for Azure Resource Manager API."""
+        try:
+            if self._auth_mode in ("client_credentials", "certificate"):
+                result = self.app.acquire_token_for_client(scopes=ARM_SCOPES)
+            else:
+                # Delegated auth for ARM
+                result = self.app.acquire_token_interactive(
+                    scopes=["https://management.azure.com/user_impersonation"]
+                ) if self._auth_mode == "interactive" else None
+
+                if result is None:
+                    log.warn("ARM auth requires client credentials or interactive mode for delegated flow")
+                    return False
+
+            if result and "access_token" in result:
+                with self._token_lock:
+                    self.arm_token = result["access_token"]
+                    self.arm_token_expiry = datetime.now(timezone.utc) + timedelta(
+                        seconds=result.get("expires_in", 3600)
+                    )
+                log.success("Authenticated to Azure Resource Manager")
+                return True
+            else:
+                error = result.get("error_description", "Unknown error") if result else "No result"
+                log.warn(f"ARM authentication failed: {error}")
+                return False
+        except Exception as e:
+            log.warn(f"ARM authentication failed (may not have ARM permissions): {e}")
+            return False
+
     def _ensure_token(self):
         """Refresh token if expired (thread-safe)."""
         with self._token_lock:
             if not self.token or (self.token_expiry and datetime.now(timezone.utc) >= self.token_expiry - timedelta(minutes=5)):
                 self.authenticate()
+
+    def _ensure_arm_token(self):
+        """Refresh ARM token if expired (thread-safe)."""
+        with self._token_lock:
+            if not self.arm_token or (self.arm_token_expiry and datetime.now(timezone.utc) >= self.arm_token_expiry - timedelta(minutes=5)):
+                self.authenticate_arm()
 
     def _headers(self) -> dict:
         self._ensure_token()
@@ -544,6 +636,22 @@ class GraphClient:
             "Content-Type": "application/json",
             "ConsistencyLevel": "eventual",
         }
+
+    def _arm_headers(self) -> dict:
+        self._ensure_arm_token()
+        return {
+            "Authorization": f"Bearer {self.arm_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _log_error(self, endpoint: str, error: str, status_code: int = 0):
+        """Record structured error for post-investigation summary."""
+        self.errors.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "endpoint": endpoint,
+            "error": str(error)[:500],
+            "statusCode": status_code,
+        })
 
     def _handle_rate_limit(self, resp):
         """Handle Graph API throttling with exponential backoff."""
@@ -584,12 +692,14 @@ class GraphClient:
                     continue
                 body = getattr(resp, 'text', '')[:500] if resp else ''
                 log.error(f"Graph API error ({endpoint}): {e} - {body}")
+                self._log_error(endpoint, f"{e} - {body}", status)
                 return None
             except Exception as e:
                 if attempt < retries:
                     time.sleep(2 ** attempt)
                     continue
                 log.error(f"Graph API request failed ({endpoint}): {e}")
+                self._log_error(endpoint, str(e))
                 return None
         return None
 
@@ -659,6 +769,84 @@ class GraphClient:
                     results[name] = None
 
         return results
+
+    # ── ARM API Methods ──
+
+    def arm_get(self, url: str, params: dict | None = None, retries: int = 3) -> dict | None:
+        """Make a GET request to Azure Resource Manager API."""
+        if not self.arm_token:
+            return None
+
+        if params is None:
+            params = {}
+
+        for attempt in range(retries + 1):
+            try:
+                self.api_call_count += 1
+                resp = requests.get(url, headers=self._arm_headers(), params=params, timeout=60)
+
+                if self._handle_rate_limit(resp):
+                    continue
+
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                status = getattr(resp, 'status_code', 0)
+                if status in (503, 504) and attempt < retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                self._log_error(url, str(e), status)
+                log.error(f"ARM API error: {e}")
+                return None
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                self._log_error(url, str(e))
+                return None
+        return None
+
+    def arm_get_all(self, url: str, params: dict | None = None, max_records: int = 5000) -> list[dict]:
+        """Get all pages of ARM API results."""
+        if not self.arm_token:
+            return []
+
+        results = []
+        if params is None:
+            params = {}
+
+        while url and len(results) < max_records:
+            try:
+                self.api_call_count += 1
+                resp = requests.get(url, headers=self._arm_headers(), params=params, timeout=60)
+
+                if self._handle_rate_limit(resp):
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                results.extend(data.get("value", []))
+                url = data.get("nextLink") or data.get("@odata.nextLink")
+                params = {}
+            except Exception as e:
+                log.error(f"ARM API pagination error: {e}")
+                break
+
+        return results[:max_records]
+
+    def get_subscriptions(self) -> list[dict]:
+        """List all Azure subscriptions accessible to the authenticated principal."""
+        url = f"{ARM_BASE}/subscriptions?api-version=2022-12-01"
+        result = self.arm_get(url)
+        if result and "value" in result:
+            return result["value"]
+        return []
+
+    def export_errors(self, exporter: 'DataExporter'):
+        """Export structured error log for investigation QA."""
+        if self.errors:
+            exporter.export("API_Errors", self.errors, "Summary")
+            log.warn(f"{len(self.errors)} API call(s) failed during investigation - see API_Errors report")
 
 
 # ============================================================================
@@ -2380,6 +2568,616 @@ class TenantInvestigator:
         if not cae.get("isEnabled"):
             log.investigate("Continuous Access Evaluation (CAE) is NOT enabled - tokens cannot be revoked in real-time",
                             mitre_ids=["T1550.001"])
+
+
+# ============================================================================
+# AZURE RESOURCE MANAGER INVESTIGATION
+# ============================================================================
+
+class AzureResourceInvestigator:
+    """Investigates Azure infrastructure: activity logs, Key Vault, storage, networking, compute."""
+
+    def __init__(self, graph: GraphClient, exporter: DataExporter,
+                 start_date: datetime, end_date: datetime):
+        self.graph = graph
+        self.exporter = exporter
+        self.start_date = start_date
+        self.end_date = end_date
+        self.subscriptions: list[dict] = []
+
+    def run_all(self):
+        log.info("=" * 50)
+        log.info("Starting Azure Resource Manager Investigation")
+        log.info("=" * 50)
+
+        if not self.graph.arm_token:
+            if not self.graph.authenticate_arm():
+                log.warn("Skipping ARM investigation (no ARM token available)")
+                return
+
+        self.subscriptions = self.graph.get_subscriptions()
+        if not self.subscriptions:
+            log.warn("No Azure subscriptions accessible - skipping ARM investigation")
+            return
+
+        log.info(f"Found {len(self.subscriptions)} subscription(s)")
+        self.exporter.export("AzureSubscriptions", [{
+            "subscriptionId": s.get("subscriptionId"),
+            "displayName": s.get("displayName"),
+            "state": s.get("state"),
+            "tenantId": s.get("tenantId"),
+        } for s in self.subscriptions], "Azure")
+
+        steps = [
+            ("Activity Logs", self.get_activity_logs),
+            ("Key Vaults", self.get_key_vaults),
+            ("Storage Accounts", self.get_storage_accounts),
+            ("Network Security Groups", self.get_nsgs),
+            ("Virtual Machines", self.get_virtual_machines),
+            ("Diagnostic Settings", self.get_diagnostic_settings),
+            ("Resource Locks", self.get_resource_locks),
+            ("Role Assignments", self.get_role_assignments),
+        ]
+
+        for i, (label, func) in enumerate(steps, 1):
+            log.progress(i, len(steps), f"Azure: {label}")
+            try:
+                func()
+            except Exception as e:
+                log.error(f"Failed during Azure {label}: {e}")
+
+        log.success("Azure Resource Manager investigation complete")
+
+    def get_activity_logs(self):
+        """Collect Azure Activity Logs (management plane operations)."""
+        log.info("=== Collecting Azure Activity Logs ===")
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            filter_str = (
+                f"eventTimestamp ge '{self.start_date.strftime('%Y-%m-%dT%H:%M:%SZ')}' "
+                f"and eventTimestamp le '{self.end_date.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
+            )
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers/Microsoft.Insights"
+                   f"/eventtypes/management/values?api-version={ARM_API_VERSIONS['activityLog']}")
+
+            events = self.graph.arm_get_all(url, params={"$filter": filter_str}, max_records=10000)
+            if not events:
+                continue
+
+            log_data = []
+            suspicious_ops = []
+            for e in events:
+                auth = e.get("authorization", {})
+                claims = e.get("claims", {})
+                entry = {
+                    "eventTimestamp": e.get("eventTimestamp"),
+                    "operationName": e.get("operationName", {}).get("localizedValue", ""),
+                    "operationId": e.get("operationName", {}).get("value", ""),
+                    "status": e.get("status", {}).get("localizedValue", ""),
+                    "caller": e.get("caller"),
+                    "callerIpAddress": e.get("callerIpAddress") or e.get("httpRequest", {}).get("clientIpAddress"),
+                    "resourceId": e.get("resourceId", "")[:200],
+                    "resourceGroupName": e.get("resourceGroupName"),
+                    "subscriptionId": sub_id,
+                    "level": e.get("level"),
+                    "correlationId": e.get("correlationId"),
+                    "action": auth.get("action", ""),
+                    "scope": auth.get("scope", "")[:200],
+                }
+                log_data.append(entry)
+
+                # Flag suspicious operations
+                op_name = entry["operationId"].lower()
+                if any(s in op_name for s in (
+                    "microsoft.authorization/roleassignments/write",
+                    "microsoft.keyvault/vaults/secrets",
+                    "microsoft.compute/virtualmachines/write",
+                    "microsoft.network/networksecuritygroups/securityrules/write",
+                    "microsoft.storage/storageaccounts/listkeys",
+                    "microsoft.authorization/policydefinitions/delete",
+                    "microsoft.security/securitycontacts/delete",
+                    "microsoft.insights/diagnosticsettings/delete",
+                )):
+                    suspicious_ops.append(entry)
+
+            self.exporter.export(f"ActivityLog_{sub_id[:8]}", log_data, "Azure")
+
+            if suspicious_ops:
+                self.exporter.export(f"SuspiciousActivityLog_{sub_id[:8]}", suspicious_ops, "Azure", investigate=True)
+                log.investigate(
+                    f"Found {len(suspicious_ops)} suspicious ARM operation(s) in subscription {sub_id[:8]}",
+                    mitre_ids=["T1098"]
+                )
+
+    def get_key_vaults(self):
+        """Enumerate Key Vaults and check access policies."""
+        log.info("=== Collecting Key Vault Configuration ===")
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers/Microsoft.KeyVault"
+                   f"/vaults?api-version={ARM_API_VERSIONS['keyVault']}")
+
+            vaults = self.graph.arm_get_all(url)
+            if not vaults:
+                continue
+
+            vault_data = []
+            for v in vaults:
+                props = v.get("properties", {})
+                access_policies = props.get("accessPolicies", [])
+                vault_data.append({
+                    "name": v.get("name"),
+                    "location": v.get("location"),
+                    "resourceGroup": v.get("id", "").split("/")[4] if len(v.get("id", "").split("/")) > 4 else "",
+                    "enableRbacAuthorization": props.get("enableRbacAuthorization"),
+                    "enableSoftDelete": props.get("enableSoftDelete"),
+                    "enablePurgeProtection": props.get("enablePurgeProtection"),
+                    "softDeleteRetentionInDays": props.get("softDeleteRetentionInDays"),
+                    "networkAclDefaultAction": props.get("networkAcls", {}).get("defaultAction"),
+                    "accessPolicyCount": len(access_policies),
+                    "publicNetworkAccess": props.get("publicNetworkAccess"),
+                })
+
+                # Flag insecure configs
+                if not props.get("enablePurgeProtection"):
+                    log.investigate(f"Key Vault '{v.get('name')}' has purge protection DISABLED",
+                                    mitre_ids=["T1485"])
+                if props.get("networkAcls", {}).get("defaultAction") == "Allow":
+                    log.investigate(f"Key Vault '{v.get('name')}' allows public network access",
+                                    mitre_ids=["T1530"])
+
+            self.exporter.export(f"KeyVaults_{sub_id[:8]}", vault_data, "Azure")
+
+    def get_storage_accounts(self):
+        """Enumerate storage accounts and check security configuration."""
+        log.info("=== Collecting Storage Account Configuration ===")
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers/Microsoft.Storage"
+                   f"/storageAccounts?api-version={ARM_API_VERSIONS['storage']}")
+
+            accounts = self.graph.arm_get_all(url)
+            if not accounts:
+                continue
+
+            sa_data = []
+            for a in accounts:
+                props = a.get("properties", {})
+                sa_data.append({
+                    "name": a.get("name"),
+                    "location": a.get("location"),
+                    "kind": a.get("kind"),
+                    "httpsOnly": props.get("supportsHttpsTrafficOnly"),
+                    "minimumTlsVersion": props.get("minimumTlsVersion"),
+                    "allowBlobPublicAccess": props.get("allowBlobPublicAccess"),
+                    "allowSharedKeyAccess": props.get("allowSharedKeyAccess"),
+                    "networkDefaultAction": props.get("networkAcls", {}).get("defaultAction"),
+                    "infrastructureEncryption": props.get("encryption", {}).get("requireInfrastructureEncryption"),
+                    "publicNetworkAccess": props.get("publicNetworkAccess"),
+                })
+
+                if props.get("allowBlobPublicAccess"):
+                    log.investigate(f"Storage account '{a.get('name')}' allows public blob access",
+                                    mitre_ids=["T1530"])
+
+            self.exporter.export(f"StorageAccounts_{sub_id[:8]}", sa_data, "Azure")
+
+    def get_nsgs(self):
+        """Collect Network Security Groups and flag overly permissive rules."""
+        log.info("=== Collecting Network Security Groups ===")
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers/Microsoft.Network"
+                   f"/networkSecurityGroups?api-version={ARM_API_VERSIONS['network']}")
+
+            nsgs = self.graph.arm_get_all(url)
+            if not nsgs:
+                continue
+
+            nsg_data = []
+            risky_rules = []
+            for nsg in nsgs:
+                rules = nsg.get("properties", {}).get("securityRules", [])
+                for rule in rules:
+                    rp = rule.get("properties", {})
+                    entry = {
+                        "nsgName": nsg.get("name"),
+                        "ruleName": rule.get("name"),
+                        "direction": rp.get("direction"),
+                        "access": rp.get("access"),
+                        "protocol": rp.get("protocol"),
+                        "sourceAddressPrefix": rp.get("sourceAddressPrefix"),
+                        "destinationAddressPrefix": rp.get("destinationAddressPrefix"),
+                        "destinationPortRange": rp.get("destinationPortRange"),
+                        "priority": rp.get("priority"),
+                    }
+                    nsg_data.append(entry)
+
+                    # Flag any-any inbound Allow rules
+                    if (rp.get("direction") == "Inbound" and
+                        rp.get("access") == "Allow" and
+                        rp.get("sourceAddressPrefix") in ("*", "0.0.0.0/0", "Internet") and
+                        rp.get("destinationPortRange") in ("*", "22", "3389", "445", "1433")):
+                        risky_rules.append(entry)
+
+            if nsg_data:
+                self.exporter.export(f"NSGRules_{sub_id[:8]}", nsg_data, "Azure")
+            if risky_rules:
+                self.exporter.export(f"RiskyNSGRules_{sub_id[:8]}", risky_rules, "Azure", investigate=True)
+                log.investigate(
+                    f"Found {len(risky_rules)} overly permissive NSG rule(s) in subscription {sub_id[:8]}",
+                    mitre_ids=["T1190"]
+                )
+
+    def get_virtual_machines(self):
+        """Enumerate VMs and check for security-relevant properties."""
+        log.info("=== Collecting Virtual Machine Inventory ===")
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers/Microsoft.Compute"
+                   f"/virtualMachines?api-version={ARM_API_VERSIONS['compute']}")
+
+            vms = self.graph.arm_get_all(url)
+            if not vms:
+                continue
+
+            vm_data = []
+            for vm in vms:
+                props = vm.get("properties", {})
+                os_profile = props.get("osProfile", {})
+                identity = vm.get("identity", {})
+
+                vm_data.append({
+                    "name": vm.get("name"),
+                    "location": vm.get("location"),
+                    "vmSize": props.get("hardwareProfile", {}).get("vmSize"),
+                    "osType": props.get("storageProfile", {}).get("osDisk", {}).get("osType"),
+                    "adminUsername": os_profile.get("adminUsername"),
+                    "provisioningState": props.get("provisioningState"),
+                    "identityType": identity.get("type"),
+                    "identityPrincipalId": identity.get("principalId"),
+                    "disablePasswordAuth": os_profile.get("linuxConfiguration", {}).get("disablePasswordAuthentication"),
+                })
+
+            self.exporter.export(f"VirtualMachines_{sub_id[:8]}", vm_data, "Azure")
+
+    def get_diagnostic_settings(self):
+        """Check if diagnostic/audit logging is enabled on subscriptions."""
+        log.info("=== Checking Diagnostic Settings ===")
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers"
+                   f"/Microsoft.Insights/diagnosticSettings"
+                   f"?api-version={ARM_API_VERSIONS['diagnosticSettings']}")
+
+            result = self.graph.arm_get(url)
+            if not result:
+                log.investigate(f"No diagnostic settings found for subscription {sub_id[:8]} - audit logging may be disabled",
+                                mitre_ids=["T1562.008"])
+                continue
+
+            settings = result.get("value", [])
+            if not settings:
+                log.investigate(f"No diagnostic settings for subscription {sub_id[:8]}",
+                                mitre_ids=["T1562.008"])
+                continue
+
+            ds_data = []
+            for ds in settings:
+                props = ds.get("properties", {})
+                logs = props.get("logs", [])
+                enabled_categories = [l.get("category") for l in logs if l.get("enabled")]
+                ds_data.append({
+                    "name": ds.get("name"),
+                    "workspaceId": props.get("workspaceId", "")[:100],
+                    "storageAccountId": props.get("storageAccountId", "")[:100],
+                    "eventHubName": props.get("eventHubName"),
+                    "enabledLogCategories": "; ".join(enabled_categories),
+                    "metricsEnabled": any(m.get("enabled") for m in props.get("metrics", [])),
+                })
+
+            self.exporter.export(f"DiagnosticSettings_{sub_id[:8]}", ds_data, "Azure")
+
+    def get_resource_locks(self):
+        """Check for resource locks (deletion protection)."""
+        log.info("=== Collecting Resource Locks ===")
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers"
+                   f"/Microsoft.Authorization/locks?api-version=2016-09-01")
+
+            locks = self.graph.arm_get_all(url)
+            if locks:
+                lock_data = [{
+                    "name": l.get("name"),
+                    "level": l.get("properties", {}).get("level"),
+                    "notes": l.get("properties", {}).get("notes", "")[:200],
+                    "scope": l.get("id", "")[:200],
+                } for l in locks]
+                self.exporter.export(f"ResourceLocks_{sub_id[:8]}", lock_data, "Azure")
+            else:
+                log.investigate(f"No resource locks found in subscription {sub_id[:8]}",
+                                mitre_ids=["T1485"])
+
+    def get_role_assignments(self):
+        """Collect all role assignments (Azure RBAC) across subscriptions."""
+        log.info("=== Collecting Azure RBAC Role Assignments ===")
+        dangerous_roles = {
+            "Owner", "Contributor", "User Access Administrator",
+            "Key Vault Administrator", "Key Vault Secrets Officer",
+            "Storage Account Key Operator Service Role",
+            "Virtual Machine Contributor",
+        }
+
+        for sub in self.subscriptions:
+            sub_id = sub["subscriptionId"]
+            url = (f"{ARM_BASE}/subscriptions/{sub_id}/providers"
+                   f"/Microsoft.Authorization/roleAssignments?api-version=2022-04-01")
+
+            assignments = self.graph.arm_get_all(url)
+            if not assignments:
+                continue
+
+            # Resolve role definition names
+            role_defs = {}
+            for a in assignments:
+                rd_id = a.get("properties", {}).get("roleDefinitionId", "")
+                if rd_id and rd_id not in role_defs:
+                    rd_url = f"{ARM_BASE}{rd_id}?api-version=2022-04-01"
+                    rd = self.graph.arm_get(rd_url)
+                    if rd:
+                        role_defs[rd_id] = rd.get("properties", {}).get("roleName", "Unknown")
+
+            ra_data = []
+            elevated = []
+            for a in assignments:
+                props = a.get("properties", {})
+                role_name = role_defs.get(props.get("roleDefinitionId", ""), "Unknown")
+                entry = {
+                    "principalId": props.get("principalId"),
+                    "principalType": props.get("principalType"),
+                    "roleName": role_name,
+                    "scope": props.get("scope", "")[:200],
+                    "createdOn": props.get("createdOn"),
+                    "createdBy": props.get("createdBy"),
+                    "condition": props.get("condition", "")[:200],
+                }
+                ra_data.append(entry)
+
+                if role_name in dangerous_roles and props.get("scope", "").count("/") <= 4:
+                    elevated.append(entry)
+
+            self.exporter.export(f"RoleAssignments_{sub_id[:8]}", ra_data, "Azure")
+            if elevated:
+                self.exporter.export(f"ElevatedRoleAssignments_{sub_id[:8]}", elevated, "Azure", investigate=True)
+                log.investigate(
+                    f"Found {len(elevated)} elevated role assignment(s) at broad scope in subscription {sub_id[:8]}",
+                    mitre_ids=["T1098.003"]
+                )
+
+
+# ============================================================================
+# EXCHANGE ONLINE INVESTIGATION
+# ============================================================================
+
+class ExchangeOnlineInvestigator:
+    """Collects Exchange Online forensic data via Graph API and reporting endpoints."""
+
+    def __init__(self, graph: GraphClient, exporter: DataExporter,
+                 start_date: datetime, end_date: datetime, users: list[str] | None = None):
+        self.graph = graph
+        self.exporter = exporter
+        self.start_date = start_date
+        self.end_date = end_date
+        self.users = users or []
+
+    def run_all(self):
+        log.info("=" * 50)
+        log.info("Starting Exchange Online Investigation")
+        log.info("=" * 50)
+
+        steps = [
+            ("Mail Flow Rules (Transport Rules)", self.get_transport_rules),
+            ("Accepted Domains", self.get_accepted_domains),
+            ("Organization Config", self.get_org_config),
+            ("Mobile Device Policies", self.get_mobile_device_policies),
+            ("Anti-Phishing Policies", self.get_anti_phishing_policies),
+            ("Mailbox Forwarding Rules", self.get_mailbox_forwarding),
+            ("Mailbox Delegates", self.get_mailbox_delegates),
+            ("Recent Email Activity", self.get_email_activity_reports),
+        ]
+
+        for i, (label, func) in enumerate(steps, 1):
+            log.progress(i, len(steps), f"Exchange: {label}")
+            try:
+                func()
+            except Exception as e:
+                log.error(f"Failed during Exchange {label}: {e}")
+
+        log.success("Exchange Online investigation complete")
+
+    def get_transport_rules(self):
+        """Collect Exchange transport rules (mail flow rules) via audit log."""
+        log.info("=== Collecting Transport Rule Configuration ===")
+        # Query audit logs for transport rule changes
+        transport_ops = [
+            "New-TransportRule", "Set-TransportRule", "Remove-TransportRule",
+            "Enable-TransportRule", "Disable-TransportRule",
+        ]
+
+        for op in transport_ops:
+            logs = self.graph.get_all(
+                "auditLogs/directoryAudits",
+                params={"$filter": f"activityDisplayName eq '{op}'"}
+            )
+            if logs:
+                rule_data = [{
+                    "activityDateTime": e.get("activityDateTime"),
+                    "operation": e.get("activityDisplayName"),
+                    "initiatedBy": json.dumps(e.get("initiatedBy", {}), default=str)[:300],
+                    "targetResources": json.dumps(e.get("targetResources", []), default=str)[:500],
+                    "result": e.get("result"),
+                } for e in logs]
+                self.exporter.export("TransportRuleAudit", rule_data, "Exchange", investigate=True)
+                log.investigate(f"Found {len(rule_data)} transport rule '{op}' event(s)",
+                                mitre_ids=["T1114.003"])
+
+    def get_accepted_domains(self):
+        """List accepted domains in Exchange Online."""
+        log.info("=== Collecting Accepted Domains ===")
+        domains = self.graph.get_all("domains")
+        if not domains:
+            return
+
+        exo_domains = [{
+            "id": d.get("id"),
+            "isDefault": d.get("isDefault"),
+            "isVerified": d.get("isVerified"),
+            "authenticationType": d.get("authenticationType"),
+            "supportedServices": "; ".join(d.get("supportedServices", [])),
+            "passwordValidityPeriodInDays": d.get("passwordValidityPeriodInDays"),
+        } for d in domains if "Email" in d.get("supportedServices", [])]
+
+        if exo_domains:
+            self.exporter.export("AcceptedDomains", exo_domains, "Exchange")
+
+    def get_org_config(self):
+        """Collect Exchange-relevant organization settings."""
+        log.info("=== Collecting Exchange Organization Config ===")
+        # Check for legacy auth via organization branding / auth policies
+        org = self.graph.get("organization")
+        if org and "value" in org:
+            for o in org["value"]:
+                plans = [p["service"] for p in o.get("assignedPlans", [])
+                         if p.get("capabilityStatus") == "Enabled" and "exchange" in p.get("service", "").lower()]
+                if plans:
+                    self.exporter.export("ExchangePlans", [{"enabledPlans": "; ".join(plans)}], "Exchange")
+
+    def get_mobile_device_policies(self):
+        """Collect mobile device mailbox policies (EAS/MDM)."""
+        log.info("=== Collecting Mobile Device Policies ===")
+        policies = self.graph.get_all("deviceManagement/deviceCompliancePolicies", beta=True)
+        if not policies:
+            return
+
+        policy_data = [{
+            "displayName": p.get("displayName"),
+            "createdDateTime": p.get("createdDateTime"),
+            "lastModifiedDateTime": p.get("lastModifiedDateTime"),
+            "passwordRequired": p.get("passwordRequired"),
+            "passwordMinimumLength": p.get("passwordMinimumLength"),
+            "deviceThreatProtectionEnabled": p.get("deviceThreatProtectionEnabled"),
+        } for p in policies]
+
+        self.exporter.export("MobileDevicePolicies", policy_data, "Exchange")
+
+    def get_anti_phishing_policies(self):
+        """Check anti-phishing/anti-spam policy configuration via audit logs."""
+        log.info("=== Checking Anti-Phishing Policy Changes ===")
+        filter_ops = [
+            "Set-AntiPhishPolicy", "New-AntiPhishPolicy",
+            "Set-HostedContentFilterPolicy", "Set-MalwareFilterPolicy",
+        ]
+        for op in filter_ops:
+            logs = self.graph.get_all(
+                "auditLogs/directoryAudits",
+                params={"$filter": f"activityDisplayName eq '{op}'"}
+            )
+            if logs:
+                data = [{
+                    "activityDateTime": e.get("activityDateTime"),
+                    "operation": e.get("activityDisplayName"),
+                    "initiatedBy": json.dumps(e.get("initiatedBy", {}), default=str)[:300],
+                    "result": e.get("result"),
+                } for e in logs]
+                self.exporter.export("AntiPhishPolicyChanges", data, "Exchange", investigate=True)
+
+    def get_mailbox_forwarding(self):
+        """Check for mailbox forwarding rules across target users."""
+        log.info("=== Checking Mailbox Forwarding Configuration ===")
+        for upn in self.users:
+            # Get mailbox settings
+            settings = self.graph.get(f"users/{upn}/mailboxSettings")
+            if not settings:
+                continue
+
+            auto_replies = settings.get("automaticRepliesSetting", {})
+            forwarding_data = {
+                "userPrincipalName": upn,
+                "automaticRepliesStatus": auto_replies.get("status"),
+                "externalAudience": auto_replies.get("externalAudience"),
+                "hasExternalReplyMessage": bool(auto_replies.get("externalReplyMessage")),
+            }
+
+            # Check inbox rules for forwarding
+            rules = self.graph.get_all(f"users/{upn}/mailFolders/inbox/messageRules")
+            forwarding_rules = []
+            for r in rules:
+                actions = r.get("actions", {})
+                if actions.get("forwardTo") or actions.get("forwardAsAttachmentTo") or actions.get("redirectTo"):
+                    forwarding_rules.append({
+                        "ruleName": r.get("displayName"),
+                        "isEnabled": r.get("isEnabled"),
+                        "forwardTo": json.dumps(actions.get("forwardTo", []), default=str)[:300],
+                        "forwardAsAttachment": json.dumps(actions.get("forwardAsAttachmentTo", []), default=str)[:300],
+                        "redirectTo": json.dumps(actions.get("redirectTo", []), default=str)[:300],
+                        "deleteMessage": actions.get("delete", False),
+                        "moveToDeletedItems": actions.get("moveToFolder") == "deleteditems",
+                    })
+
+            if forwarding_rules:
+                self.exporter.export(f"MailboxForwarding_{upn.split('@')[0]}", forwarding_rules,
+                                     "Exchange", investigate=True)
+                log.investigate(f"User {upn} has {len(forwarding_rules)} forwarding rule(s)",
+                                mitre_ids=["T1114.003"])
+
+    def get_mailbox_delegates(self):
+        """Check for mailbox delegation permissions."""
+        log.info("=== Checking Mailbox Delegates ===")
+        for upn in self.users:
+            # Check mailbox permissions via Graph
+            perms = self.graph.get(f"users/{upn}/mailFolders/inbox/permissions", beta=True)
+            if not perms or "value" not in perms:
+                continue
+
+            delegates = []
+            for p in perms["value"]:
+                if p.get("emailAddress", {}).get("address"):
+                    delegates.append({
+                        "userPrincipalName": upn,
+                        "delegateEmail": p.get("emailAddress", {}).get("address"),
+                        "delegateName": p.get("emailAddress", {}).get("name"),
+                        "role": p.get("role"),
+                        "isInsideOrganization": p.get("isInsideOrganization"),
+                    })
+
+            if delegates:
+                self.exporter.export(f"MailboxDelegates_{upn.split('@')[0]}", delegates,
+                                     "Exchange", investigate=True)
+                log.investigate(f"User {upn} has {len(delegates)} mailbox delegate(s)",
+                                mitre_ids=["T1098.002"])
+
+    def get_email_activity_reports(self):
+        """Collect email activity usage reports via Graph Reports API."""
+        log.info("=== Collecting Email Activity Reports ===")
+        # User email activity (last 30 days)
+        report = self.graph.get(
+            "reports/getEmailActivityUserDetail(period='D30')",
+            params={"$format": "application/json"},
+            beta=True
+        )
+        if report and "value" in report:
+            activity_data = [{
+                "userPrincipalName": r.get("userPrincipalName"),
+                "lastActivityDate": r.get("lastActivityDate"),
+                "sendCount": r.get("sendCount"),
+                "receiveCount": r.get("receiveCount"),
+                "readCount": r.get("readCount"),
+                "isDeleted": r.get("isDeleted"),
+            } for r in report["value"]]
+
+            if activity_data:
+                self.exporter.export("EmailActivityReport", activity_data, "Exchange")
 
 
 # ============================================================================
@@ -4818,9 +5616,149 @@ def interactive_menu() -> dict:
     return {"type": inv_type, "users": users, "ips": ips, "days": days}
 
 
+# ============================================================================
+# MULTI-TENANT ORCHESTRATOR
+# ============================================================================
+
+class MultiTenantOrchestrator:
+    """Orchestrates investigations across multiple tenants for MSP/MSSP use cases.
+
+    Config format (YAML/JSON):
+        tenants:
+          - tenant_id: "aaaa-bbbb-cccc"
+            client_id: "xxxx"
+            client_secret: "yyyy"
+            name: "Customer A"
+            type: "full"
+            users: ["admin@customera.com"]
+          - tenant_id: "dddd-eeee-ffff"
+            client_id: "xxxx"
+            client_secret: "zzzz"
+            name: "Customer B"
+            type: "tenant"
+    """
+
+    def __init__(self, config: dict, base_output: str, days: int = 90,
+                 workers: int = 4, no_html: bool = False, siem_export: str | None = None,
+                 skip_azure: bool = False, skip_exchange: bool = False):
+        self.tenants = config.get("tenants", [])
+        self.base_output = base_output
+        self.days = days
+        self.workers = workers
+        self.no_html = no_html
+        self.siem_export = siem_export
+        self.skip_azure = skip_azure
+        self.skip_exchange = skip_exchange
+        self.results: list[dict] = []
+
+    def run(self):
+        log.info("=" * 60)
+        log.info(f"Multi-Tenant Investigation: {len(self.tenants)} tenant(s)")
+        log.info("=" * 60)
+
+        for i, tenant_conf in enumerate(self.tenants, 1):
+            tenant_name = tenant_conf.get("name", tenant_conf.get("tenant_id", "Unknown"))
+            log.info(f"\n{'=' * 50}")
+            log.info(f"Tenant {i}/{len(self.tenants)}: {tenant_name}")
+            log.info(f"{'=' * 50}")
+
+            try:
+                result = self._investigate_tenant(tenant_conf)
+                self.results.append({"tenant": tenant_name, "status": "success", **result})
+            except Exception as e:
+                log.error(f"Tenant {tenant_name} investigation failed: {e}")
+                self.results.append({"tenant": tenant_name, "status": "failed", "error": str(e)})
+
+        self._generate_cross_tenant_summary()
+        return self.results
+
+    def _investigate_tenant(self, conf: dict) -> dict:
+        tenant_id = conf["tenant_id"]
+        client_id = conf["client_id"]
+        client_secret = conf.get("client_secret")
+        inv_type = conf.get("type", "tenant")
+        users = conf.get("users", [])
+        tenant_name = conf.get("name", tenant_id[:8])
+
+        # Create tenant-specific output
+        output_root = os.path.join(self.base_output, f"Tenant_{tenant_name}")
+        os.makedirs(output_root, exist_ok=True)
+        for folder in ("Tenant", "Users", "Summary", "Azure", "Exchange",
+                        "ThreatDetection", "IOCs", "Timeline", "KQL_Queries", "Remediation"):
+            os.makedirs(os.path.join(output_root, folder), exist_ok=True)
+
+        exporter = DataExporter(output_root)
+
+        # Authenticate
+        graph = GraphClient(
+            tenant_id=tenant_id,
+            client_id=client_id,
+            client_secret=client_secret,
+            max_workers=self.workers,
+        )
+
+        if not graph.authenticate():
+            raise RuntimeError(f"Authentication failed for tenant {tenant_name}")
+
+        start_date = datetime.now(timezone.utc) - timedelta(days=self.days)
+        end_date = datetime.now(timezone.utc)
+
+        # Run investigation modules
+        if inv_type in ("tenant", "full", "complete"):
+            tenant_inv = TenantInvestigator(graph, exporter, start_date, end_date)
+            tenant_inv.run_all()
+
+        if inv_type in ("user", "full", "complete") and users:
+            for upn in users:
+                user_inv = UserInvestigator(graph, exporter, upn, start_date, end_date)
+                user_inv.run_all()
+
+        if inv_type in ("bec", "complete") and users:
+            for upn in users:
+                bec = BECInvestigator(graph, exporter, upn, start_date, end_date)
+                bec.run_all()
+
+        # Azure investigation
+        if not self.skip_azure and inv_type in ("full", "complete"):
+            azure_inv = AzureResourceInvestigator(graph, exporter, start_date, end_date)
+            azure_inv.run_all()
+
+        # Exchange investigation
+        if not self.skip_exchange and inv_type in ("full", "complete"):
+            exo_inv = ExchangeOnlineInvestigator(graph, exporter, start_date, end_date, users)
+            exo_inv.run_all()
+
+        graph.export_errors(exporter)
+
+        return {
+            "records": exporter.total_records,
+            "findings": log.suspicious_count,
+            "api_calls": graph.api_call_count,
+            "output": output_root,
+        }
+
+    def _generate_cross_tenant_summary(self):
+        """Generate a cross-tenant summary report."""
+        summary_path = os.path.join(self.base_output, "CrossTenantSummary.json")
+        summary = {
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "totalTenants": len(self.tenants),
+            "successful": sum(1 for r in self.results if r["status"] == "success"),
+            "failed": sum(1 for r in self.results if r["status"] == "failed"),
+            "tenantResults": self.results,
+        }
+
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+        log.info(f"\nCross-tenant summary saved to: {summary_path}")
+        log.success(f"Multi-tenant investigation complete: "
+                     f"{summary['successful']}/{summary['totalTenants']} succeeded")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="VCD Cloud Investigation Tool v2 - Advanced forensics for M365/Entra ID/Azure",
+        description="VCD Cloud Investigation Tool v3 - Advanced forensics for M365/Entra ID/Azure",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -4831,6 +5769,7 @@ Examples:
   %(prog)s --type bec --users cfo@contoso.com --days 14
   %(prog)s --type complete --users user@contoso.com --days 30
   %(prog)s --config investigation.yml
+  %(prog)s --multi-tenant --config tenants.yml --days 30
 
 Environment Variables:
   VCD_TENANT_ID        Azure AD Tenant ID
@@ -4843,9 +5782,9 @@ Investigation Types:
   tenant    - Organization-wide security config and audit log collection
   user      - Deep-dive investigation of specific user account(s)
   ip        - Search all tenant activity from specific IP address(es)
-  full      - Tenant investigation + User investigation(s)
+  full      - Tenant + User + Azure + Exchange investigation(s)
   bec       - Business Email Compromise focused investigation
-  complete  - Everything: Tenant + Users + BEC + SharePoint + Teams + Threat Detection
+  complete  - Everything: Tenant + Users + BEC + SharePoint + Teams + Azure + Exchange + Threat Detection
         """,
     )
     parser.add_argument("--type", choices=["tenant", "user", "ip", "full", "bec", "complete"],
@@ -4867,6 +5806,10 @@ Investigation Types:
     parser.add_argument("--skip-sharepoint", action="store_true", help="Skip SharePoint/OneDrive investigation")
     parser.add_argument("--skip-teams", action="store_true", help="Skip Teams investigation")
     parser.add_argument("--skip-threat-detection", action="store_true", help="Skip automated threat detection")
+    parser.add_argument("--skip-azure", action="store_true", help="Skip Azure Resource Manager investigation")
+    parser.add_argument("--skip-exchange", action="store_true", help="Skip Exchange Online investigation")
+    parser.add_argument("--multi-tenant", action="store_true", help="Multi-tenant mode (requires --config with tenants list)")
+    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     parser.add_argument("--version", action="version", version=f"VCD Cloud Investigator v{VERSION}")
 
     args = parser.parse_args()
@@ -4928,11 +5871,31 @@ Investigation Types:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_root = os.path.join(os.getcwd(), f"VCDCloudInvestigation_{ts}")
 
+    # Multi-tenant mode: delegate to orchestrator and exit
+    if args.multi_tenant:
+        if not config.get("tenants"):
+            log.error("Multi-tenant mode requires --config with a 'tenants' list")
+            sys.exit(1)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mt_output = args.output or os.path.join(os.getcwd(), f"VCD_MultiTenant_{ts}")
+        os.makedirs(mt_output, exist_ok=True)
+        log.set_output_root(mt_output)
+
+        orchestrator = MultiTenantOrchestrator(
+            config=config, base_output=mt_output, days=days,
+            workers=args.workers, no_html=args.no_html_report,
+            siem_export=args.siem_export, skip_azure=args.skip_azure,
+            skip_exchange=args.skip_exchange,
+        )
+        orchestrator.run()
+        return
+
     os.makedirs(output_root, exist_ok=True)
     for folder in ("Tenant", "Users", "IP_Investigation", "Summary",
                     "ThreatDetection", "IOCs", "BEC_Investigation",
                     "SharePoint", "Teams", "SIEM_Export", "Analysis",
-                    "Timeline", "KQL_Queries", "Remediation"):
+                    "Timeline", "KQL_Queries", "Remediation",
+                    "Azure", "Exchange"):
         os.makedirs(os.path.join(output_root, folder), exist_ok=True)
 
     log.set_output_root(output_root)
@@ -4980,6 +5943,9 @@ Investigation Types:
         log.error("Authentication failed. Exiting.")
         sys.exit(1)
 
+    # Initialize checkpoint for resume support
+    checkpoint = InvestigationCheckpoint(output_root) if args.resume else None
+
     # Initialize threat detection and IOC extraction
     threat_engine = ThreatDetectionEngine(exporter) if not args.skip_threat_detection else None
     ioc_extractor = IOCExtractor(exporter)
@@ -4990,36 +5956,73 @@ Investigation Types:
 
     # ── Tenant Investigation ──
     if inv_type in ("tenant", "full", "complete"):
-        tenant = TenantInvestigator(graph, exporter, start_date, end_date)
-        tenant.run_all()
+        if not checkpoint or not checkpoint.is_done("tenant"):
+            tenant = TenantInvestigator(graph, exporter, start_date, end_date)
+            tenant.run_all()
+            if checkpoint:
+                checkpoint.mark_done("tenant")
 
     # ── User Investigation ──
     if inv_type in ("user", "full", "complete"):
         for upn in users:
-            user_inv = UserInvestigator(graph, exporter, upn, start_date, end_date)
-            user_inv.run_all()
+            step_key = f"user_{upn}"
+            if not checkpoint or not checkpoint.is_done(step_key):
+                user_inv = UserInvestigator(graph, exporter, upn, start_date, end_date)
+                user_inv.run_all()
+                if checkpoint:
+                    checkpoint.mark_done(step_key)
 
     # ── BEC Investigation ──
     if inv_type in ("bec", "complete"):
         for upn in users:
-            bec = BECInvestigator(graph, exporter, upn, start_date, end_date)
-            bec.run_all()
+            step_key = f"bec_{upn}"
+            if not checkpoint or not checkpoint.is_done(step_key):
+                bec = BECInvestigator(graph, exporter, upn, start_date, end_date)
+                bec.run_all()
+                if checkpoint:
+                    checkpoint.mark_done(step_key)
 
     # ── IP Investigation ──
     if inv_type == "ip":
         for ip in ips:
-            ip_inv = IPInvestigator(graph, exporter, ip, start_date, end_date)
-            ip_inv.run_all()
+            step_key = f"ip_{ip}"
+            if not checkpoint or not checkpoint.is_done(step_key):
+                ip_inv = IPInvestigator(graph, exporter, ip, start_date, end_date)
+                ip_inv.run_all()
+                if checkpoint:
+                    checkpoint.mark_done(step_key)
+
+    # ── Azure Resource Manager Investigation ──
+    if inv_type in ("full", "complete") and not args.skip_azure:
+        if not checkpoint or not checkpoint.is_done("azure"):
+            azure_inv = AzureResourceInvestigator(graph, exporter, start_date, end_date)
+            azure_inv.run_all()
+            if checkpoint:
+                checkpoint.mark_done("azure")
+
+    # ── Exchange Online Investigation ──
+    if inv_type in ("full", "complete") and not args.skip_exchange:
+        if not checkpoint or not checkpoint.is_done("exchange"):
+            exo_inv = ExchangeOnlineInvestigator(graph, exporter, start_date, end_date, users)
+            exo_inv.run_all()
+            if checkpoint:
+                checkpoint.mark_done("exchange")
 
     # ── SharePoint/OneDrive Investigation ──
     if inv_type == "complete" and not args.skip_sharepoint:
-        sp = SharePointInvestigator(graph, exporter, start_date, end_date)
-        sp.run_all()
+        if not checkpoint or not checkpoint.is_done("sharepoint"):
+            sp = SharePointInvestigator(graph, exporter, start_date, end_date)
+            sp.run_all()
+            if checkpoint:
+                checkpoint.mark_done("sharepoint")
 
     # ── Teams Investigation ──
     if inv_type == "complete" and not args.skip_teams:
-        teams = TeamsInvestigator(graph, exporter)
-        teams.run_all()
+        if not checkpoint or not checkpoint.is_done("teams"):
+            teams = TeamsInvestigator(graph, exporter)
+            teams.run_all()
+            if checkpoint:
+                checkpoint.mark_done("teams")
 
     # ── Threat Detection Engine ──
     if threat_engine:
@@ -5155,6 +6158,14 @@ Investigation Types:
         html_gen = HTMLReportGenerator(output_root, investigation_id)
         html_gen.generate(inv_type, days, start_date, end_date, start_time, users, ips)
 
+    # ── Export API Errors ──
+    graph.export_errors(exporter)
+
+    # ── Clear Checkpoint on Success ──
+    if checkpoint:
+        checkpoint.clear()
+        log.info("Investigation completed successfully - checkpoint cleared")
+
     # ── Final Stats ──
     log.success("=" * 60)
     log.success(f"Investigation complete. ID: {investigation_id}")
@@ -5163,6 +6174,8 @@ Investigation Types:
     log.success(f"Suspicious findings: {log.suspicious_count}")
     log.success(f"MITRE techniques matched: {len(log.mitre_hits)}")
     log.success(f"API calls made: {graph.api_call_count}")
+    if graph.errors:
+        log.warn(f"API errors encountered: {len(graph.errors)} (see Summary/API_Errors)")
     if threat_engine:
         critical = sum(1 for d in threat_engine.detections if d["severity"] == "CRITICAL")
         high = sum(1 for d in threat_engine.detections if d["severity"] == "HIGH")
