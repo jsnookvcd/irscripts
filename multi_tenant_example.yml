@@ -1,0 +1,31 @@
+# VCD Cloud Investigator - Multi-Tenant Configuration Example
+# For MSP/MSSP operations: investigate multiple tenants in a single run.
+#
+# Usage: vcd-investigate --multi-tenant --config multi_tenant_example.yml --days 30
+#
+# Each tenant gets its own isolated output directory with full investigation results.
+# A cross-tenant summary report is generated at the end.
+
+tenants:
+  - name: "Customer A"
+    tenant_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    client_id: "11111111-2222-3333-4444-555555555555"
+    client_secret: "your-client-secret-for-customer-a"
+    type: "full"
+    users:
+      - admin@customera.onmicrosoft.com
+      - cfo@customera.com
+
+  - name: "Customer B"
+    tenant_id: "ffffffff-gggg-hhhh-iiii-jjjjjjjjjjjj"
+    client_id: "66666666-7777-8888-9999-000000000000"
+    client_secret: "your-client-secret-for-customer-b"
+    type: "tenant"
+
+  - name: "Customer C - BEC Investigation"
+    tenant_id: "kkkkkkkk-llll-mmmm-nnnn-oooooooooooo"
+    client_id: "aabbccdd-eeff-0011-2233-445566778899"
+    client_secret: "your-client-secret-for-customer-c"
+    type: "bec"
+    users:
+      - finance@customerc.com

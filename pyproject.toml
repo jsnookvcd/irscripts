@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcd-cloud-investigator"
+version = "3.0.0"
+description = "Advanced cloud forensics for Microsoft 365, Entra ID, and Azure"
+readme = "README.md"
+license = {text = "Proprietary"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Vendetta Cyber Defense"},
+]
+keywords = [
+    "cloud-forensics", "incident-response", "microsoft-365", "entra-id",
+    "azure", "dfir", "threat-hunting", "security", "graph-api",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "msal>=1.28.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+all = ["pyyaml>=6.0"]
+
+[project.scripts]
+vcd-investigate = "vcd_cloud_investigator:main"
+
+[project.urls]
+Homepage = "https://vendettacyberdefense.com"
+
+[tool.setuptools]
+py-modules = ["vcd_cloud_investigator"]

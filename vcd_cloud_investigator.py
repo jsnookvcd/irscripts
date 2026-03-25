@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Vendetta Cyber Defense - Cloud Investigation Tool v2.0
+Vendetta Cyber Defense - Cloud Investigation Tool v3.0
 The most comprehensive cloud forensics tool for Microsoft 365 / Entra ID / Azure.
 
 Surpasses: HAWK | CISA Sparrow | CrowdStrike CRT | Microsoft Extractor Suite
@@ -10,6 +10,7 @@ Author:   Vendetta Cyber Defense
 Features:
     Investigation Types:
     - 6 modes: tenant, user, ip, full, bec, complete
+    - Multi-tenant orchestration for MSP/MSSP operations
 
     Threat Detection & Analysis:
     - Automated Threat Detection Engine with 50+ rules
@@ -45,6 +46,28 @@ Features:
     - Deleted users and applications (evidence destruction)
     - Microsoft Secure Score with recommendations
     - Password and Authorization policy analysis
+    - Purview Unified Audit Log (MailItemsAccessed via Graph API)
+    - Service Principal Risk Detections
+    - Continuous Access Evaluation (CAE) policy status
+    - CAE token and Token Protection detection in sign-in logs
+
+    Azure Resource Manager Investigation:
+    - Activity logs with suspicious operation detection
+    - Key Vault security configuration audit
+    - Storage account security posture
+    - Network Security Group rule analysis
+    - Virtual machine inventory and identity audit
+    - Diagnostic settings verification
+    - Resource locks (deletion protection)
+    - Azure RBAC role assignment analysis
+
+    Exchange Online Investigation:
+    - Transport rule (mail flow) audit
+    - Accepted domains enumeration
+    - Anti-phishing policy change tracking
+    - Mailbox forwarding detection
+    - Mailbox delegate enumeration
+    - Email activity reports
 
     Output & Reporting:
     - Unified chronological timeline across all data sources
@@ -63,34 +86,37 @@ Features:
     - Rate limit handling with auto-retry and exponential backoff
     - Thread-safe token refresh
     - Progress tracking with visual progress bars
+    - Checkpoint/resume for interrupted investigations
+    - Structured API error logging
+    - Multi-tenant orchestration
 
 Usage:
     # Interactive mode
-    python vcd_cloud_investigator.py
+    vcd-investigate
 
     # Tenant investigation
-    python vcd_cloud_investigator.py --type tenant --days 90
+    vcd-investigate --type tenant --days 90
 
-    # User investigation
-    python vcd_cloud_investigator.py --type user --users user@contoso.com
-
-    # BEC investigation
-    python vcd_cloud_investigator.py --type bec --users cfo@contoso.com --days 14
+    # Full investigation (Tenant + User + Azure + Exchange)
+    vcd-investigate --type full --users user@contoso.com --days 30
 
     # Complete investigation (everything)
-    python vcd_cloud_investigator.py --type complete --users user@contoso.com --days 30
+    vcd-investigate --type complete --users user@contoso.com --days 30
+
+    # Multi-tenant from config
+    vcd-investigate --multi-tenant --config tenants.yml --days 30
+
+    # Resume interrupted investigation
+    vcd-investigate --type complete --users user@contoso.com --resume
 
     # With SIEM export
-    python vcd_cloud_investigator.py --type full --users user@contoso.com --siem-export all
+    vcd-investigate --type full --users user@contoso.com --siem-export all
 
     # From config file
-    python vcd_cloud_investigator.py --config investigation.yml
-
-    # Certificate auth
-    python vcd_cloud_investigator.py --type tenant --cert-auth /path/to/cert.pem
+    vcd-investigate --config investigation.yml
 
 Requirements:
-    pip install -r requirements.txt
+    pip install vcd-cloud-investigator
     Requires Azure AD app registration with appropriate Microsoft Graph API permissions.
 """
 
